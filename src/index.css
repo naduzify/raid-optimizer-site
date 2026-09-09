@@ -1,0 +1,12 @@
+body {
+  margin: 0;
+  background: #0a0a0a;
+  display: flex;
+  justify-content: center;
+  padding: 24px;
+  box-sizing: border-box;
+}
+#root {
+  width: 100%;
+  max-width: 900px;
+}
