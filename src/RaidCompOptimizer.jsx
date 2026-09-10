@@ -6,7 +6,7 @@ const PRESET_FACTORS = {"fury_warrior": {"base": 1485.8, "bshout": 1.00123, "san
 const SPEC_LIST = [
   { id: "fury_warrior", label: "Fury warrior", cat: "warrior", multi: true },
   { id: "kebab_warrior", label: "Kebab warrior", cat: "warrior", multi: true },
-  { id: "arms2h_warrior", label: "2H arms warrior", cat: "warrior", multi: true },
+  { id: "arms2h_warrior", label: "Slam warrior", cat: "warrior", multi: true },
   { id: "bm_hunter", label: "BM hunter", cat: "bm", multi: true },
   { id: "survival_hunter", label: "Survival hunter", cat: "sv", multi: true },
   { id: "rogue", label: "Rogue", cat: "rogue", multi: true },
@@ -116,7 +116,7 @@ function restoVariantsFor(restoCount) {
 }
 
 // best way to fill a group's remaining open slots given what's already fixed in it
-function bestFill(lockedCounts, restoCountLocked, remaining, excludeHunters, ewOverride, factors, excludedPresets, namedDpsEntries) {
+function bestFill(lockedCounts, restoCountLocked, remaining, excludeHunters, ewOverride, factors, excludedPresets, namedDpsEntries, extraBuffs) {
   const fills = [];
   function recurse(slotsLeft, addCounts, restoAdded) {
     if (slotsLeft === 0) {
@@ -142,7 +142,7 @@ function bestFill(lockedCounts, restoCountLocked, remaining, excludeHunters, ewO
     for (const k in fill.addCounts) finalCounts[k] = (finalCounts[k] || 0) + fill.addCounts[k];
     const totalResto = restoCountLocked + fill.restoAdded;
     for (const v of restoVariantsFor(totalResto)) {
-      const evalResult = evaluateGroup(finalCounts, v.a, v.w, ewOverride, factors, undefined, namedDpsEntries, excludedPresets);
+      const evalResult = evaluateGroup(finalCounts, v.a, v.w, ewOverride, factors, extraBuffs, namedDpsEntries, excludedPresets);
       if (!best || evalResult.total > best.total) {
         best = { finalCounts, restoCount: totalResto, restoVariant: v.label, ...evalResult };
       }
@@ -152,10 +152,10 @@ function bestFill(lockedCounts, restoCountLocked, remaining, excludeHunters, ewO
 }
 
 // evaluate a group using ONLY the locked units already placed - no filling of empty slots
-function evaluateLockedOnly(lockedCounts, restoCountLocked, objective, ewOverride, factors, excludedPresets, namedDpsEntries) {
+function evaluateLockedOnly(lockedCounts, restoCountLocked, objective, ewOverride, factors, excludedPresets, namedDpsEntries, extraBuffs) {
   let best = null;
   for (const v of restoVariantsFor(restoCountLocked)) {
-    const evalResult = evaluateGroup(lockedCounts, v.a, v.w, ewOverride, factors, undefined, namedDpsEntries, excludedPresets);
+    const evalResult = evaluateGroup(lockedCounts, v.a, v.w, ewOverride, factors, extraBuffs, namedDpsEntries, excludedPresets);
     const score =
       objective === "total" ? evalResult.total :
       objective === "avg_pct" ? evalResult.pctSum :
@@ -170,6 +170,30 @@ function evaluateLockedOnly(lockedCounts, restoCountLocked, objective, ewOverrid
 // ---------- placing the shared locked pool across up to 3 groups ----------
 
 // place a set of mutually-exclusive-per-group members (one category slot per group) across groups
+// Two custom profiles are interchangeable for PLACEMENT purposes if they grant the exact same set
+// of buffs to their group - which specific one ends up in which group doesn't change total raid DPS
+// (each person's own DPS depends on which buffs their group has, not on who specifically grants them).
+// So we can group contributors by this signature and feed the counts through the exact same
+// combinatorial search used for presets, then afterward assign specific named individuals to
+// whichever group each signature's count landed in. This gets a fully joint search across presets
+// AND custom profiles together, not a separate bolt-on pass.
+function contributorSignature(c) {
+  const shamanEff = c.capabilities.shaman === "enh" ? "enh"
+    : c.capabilities.shaman === "needs_totem_choice" ? (c.totemChoice || "none")
+    : "none";
+  return `w${c.capabilities.warrior ? 1 : 0}_r${c.capabilities.ret ? 1 : 0}_f${c.capabilities.feral ? 1 : 0}_fi${c.capabilities.fi || 0}_sh${shamanEff}`;
+}
+
+function groupContributorsBySignature(activeContributors) {
+  const bySignature = new Map(); // signature -> array of contributor ids (in a stable order)
+  for (const c of activeContributors) {
+    const sig = contributorSignature(c);
+    if (!bySignature.has(sig)) bySignature.set(sig, []);
+    bySignature.get(sig).push(c.id);
+  }
+  return bySignature;
+}
+
 function enumerateCategoryPlacements(memberCounts, capacities) {
   const numGroups = capacities.length;
   const ids = Object.keys(memberCounts).filter((id) => memberCounts[id] > 0);
@@ -208,16 +232,29 @@ const CATEGORY_STAGES = [
   ["ret_paladin"],
 ];
 
-function allocateRaid(pool, numGroups, objective, factors, excludedPresets, namedEntriesPerGroup) {  const MAX_STATES = 4000;
-  const namedPerGroup = namedEntriesPerGroup || Array.from({ length: numGroups }, () => []);
+function allocateRaid(pool, numGroups, objective, factors, excludedPresets, activeContributors) {  const MAX_STATES = 4000;
+  const contributors = activeContributors || [];
+  const bySignature = groupContributorsBySignature(contributors);
+  const signatureIds = [...bySignature.keys()]; // stable order for this call
+
   let states = [{
     perGroupCounts: Array.from({ length: numGroups }, () => Object.fromEntries(SPEC_LIST.map((s) => [s.id, 0]))),
     perGroupResto: Array(numGroups).fill(0),
-    caps: Array.from({ length: numGroups }, (_, g) => 5 - namedPerGroup[g].length),
+    perGroupContribCounts: Array.from({ length: numGroups }, () => Object.fromEntries(signatureIds.map((s) => [s, 0]))),
+    caps: Array(numGroups).fill(5),
   }];
 
-  for (const stage of CATEGORY_STAGES) {
-    const memberCounts = Object.fromEntries(stage.map((id) => [id, pool[id] || 0]));
+  // Custom profiles get folded into the exact same search as presets - each distinct "buff
+  // signature" among them (see contributorSignature) is treated as its own category, exactly like
+  // fury_warrior or enhance_shaman are. This means the search jointly considers where to put actual
+  // people alongside where to put custom profiles, instead of deciding one before the other.
+  const allStages = [...CATEGORY_STAGES, signatureIds.length ? signatureIds : null].filter(Boolean);
+
+  for (const stage of allStages) {
+    const isContribStage = stage === signatureIds;
+    const memberCounts = isContribStage
+      ? Object.fromEntries(signatureIds.map((sig) => [sig, bySignature.get(sig).length]))
+      : Object.fromEntries(stage.map((id) => [id, pool[id] || 0]));
     if (Object.values(memberCounts).every((c) => c === 0)) continue;
     const nextStates = [];
     for (const st of states) {
@@ -226,12 +263,14 @@ function allocateRaid(pool, numGroups, objective, factors, excludedPresets, name
       for (const p of placements) {
         const perGroupCounts = st.perGroupCounts.map((c) => ({ ...c }));
         const perGroupResto = [...st.perGroupResto];
+        const perGroupContribCounts = st.perGroupContribCounts.map((c) => ({ ...c }));
         p.perGroup.forEach((entry, g) => {
           if (!entry) return;
           if (entry.id === "resto_shaman") perGroupResto[g] += entry.n;
+          else if (isContribStage) perGroupContribCounts[g][entry.id] += entry.n;
           else perGroupCounts[g][entry.id] += entry.n;
         });
-        nextStates.push({ perGroupCounts, perGroupResto, caps: p.caps });
+        nextStates.push({ perGroupCounts, perGroupResto, perGroupContribCounts, caps: p.caps });
       }
     }
     states = nextStates;
@@ -243,7 +282,7 @@ function allocateRaid(pool, numGroups, objective, factors, excludedPresets, name
   // agility - which is higher if their own group happens to give them an agi totem. So we can't just
   // check presence; we have to figure out which totem (if any) the hunter's own group ends up with,
   // and that choice can itself affect which totem is best for that group overall.
-  function correctForSurvivalHunterAgility(groupResults, objective) {
+  function correctForSurvivalHunterAgility(groupResults, objective, namedPerGroup, perGroupExtraBuffs) {
     const svGroupIdxs = groupResults.map((r, i) => (r.lockedCounts.survival_hunter > 0 ? i : -1)).filter((i) => i >= 0);
     if (svGroupIdxs.length === 0) return groupResults;
 
@@ -263,7 +302,7 @@ function allocateRaid(pool, numGroups, objective, factors, excludedPresets, name
         const svIdx = svGroupIdxs.indexOf(i);
         const variantLabel = svIdx >= 0 ? combo[svIdx] : r.restoVariant;
         const [a, w] = restoVariantToFlags(variantLabel);
-        const ev = evaluateGroup(r.finalCounts, a, w, ewState, factors, undefined, namedPerGroup[i], excludedPresets);
+        const ev = evaluateGroup(r.finalCounts, a, w, ewState, factors, perGroupExtraBuffs[i], namedPerGroup[i], excludedPresets);
         const score = objective === "total" ? ev.total : objective === "avg_pct" ? ev.pctSum : (ev.breakdown.find((b) => b.id === objective)?.dpsEach ?? -1);
         return { ...r, restoVariant: variantLabel, ...ev, score };
       });
@@ -275,17 +314,54 @@ function allocateRaid(pool, numGroups, objective, factors, excludedPresets, name
     return best;
   }
 
+  // Converts a state's per-group SIGNATURE counts into actual named individuals - which specific
+  // person of a given signature lands in which group doesn't affect total DPS (see
+  // contributorSignature), so this just consumes each signature's id list in a stable order.
+  // Also aggregates what buffs those specific individuals grant to their group (self-included) -
+  // this is the same extraction slotsToCounts does for Build & Compare, done here so both paths
+  // agree on what a contributor placed anywhere actually contributes.
+  function resolveNamedEntries(st) {
+    const contributorById = new Map(contributors.map((c) => [c.id, c]));
+    const cursors = Object.fromEntries(signatureIds.map((s) => [s, 0]));
+    const perGroupNamed = Array.from({ length: numGroups }, () => []);
+    const perGroupExtraBuffs = Array.from({ length: numGroups }, () => ({ warrior: false, ret: false, feral: false, fi: 0, shaman: null }));
+    for (let g = 0; g < numGroups; g++) {
+      for (const sig of signatureIds) {
+        const n = st.perGroupContribCounts[g][sig] || 0;
+        const ids = bySignature.get(sig);
+        for (let k = 0; k < n; k++) {
+          const id = ids[cursors[sig]++];
+          const c = contributorById.get(id);
+          perGroupNamed[g].push({ id, name: c.name });
+          const extra = perGroupExtraBuffs[g];
+          if (c.capabilities.warrior) extra.warrior = true;
+          if (c.capabilities.ret) extra.ret = true;
+          if (c.capabilities.feral) extra.feral = true;
+          extra.fi += c.capabilities.fi || 0;
+          if (c.capabilities.shaman === "enh") {
+            extra.shaman = "enh";
+          } else if (c.totemChoice) {
+            if (c.totemChoice === "restoA") extra.shaman = extra.shaman === "restoB" ? "restoAB" : (extra.shaman === "enh" ? "enh" : "restoA");
+            if (c.totemChoice === "restoB") extra.shaman = extra.shaman === "restoA" ? "restoAB" : (extra.shaman === "enh" ? "enh" : "restoB");
+          }
+        }
+      }
+    }
+    return { perGroupNamed, perGroupExtraBuffs };
+  }
+
   const scored = [];
   for (const st of states) {
+    const { perGroupNamed: namedPerGroup, perGroupExtraBuffs } = resolveNamedEntries(st);
     let groupResults = [];
     let feasible = true;
     for (let g = 0; g < numGroups; g++) {
-      const fill = evaluateLockedOnly(st.perGroupCounts[g], st.perGroupResto[g], objective, null, factors, excludedPresets, namedPerGroup[g]);
+      const fill = evaluateLockedOnly(st.perGroupCounts[g], st.perGroupResto[g], objective, null, factors, excludedPresets, namedPerGroup[g], perGroupExtraBuffs[g]);
       if (!fill) { feasible = false; break; }
-      groupResults.push({ ...fill, lockedCounts: st.perGroupCounts[g], lockedResto: st.perGroupResto[g], remaining: st.caps[g], namedEntries: namedPerGroup[g] });
+      groupResults.push({ ...fill, lockedCounts: st.perGroupCounts[g], lockedResto: st.perGroupResto[g], remaining: st.caps[g], namedEntries: namedPerGroup[g], extraBuffs: perGroupExtraBuffs[g] });
     }
     if (!feasible) continue;
-    groupResults = correctForSurvivalHunterAgility(groupResults, objective);
+    groupResults = correctForSurvivalHunterAgility(groupResults, objective, namedPerGroup, perGroupExtraBuffs);
     const raidTotal = groupResults.reduce((a, r) => a + r.total, 0);
     const raidPctSum = groupResults.reduce((a, r) => a + r.pctSum, 0);
     const raidPlayerCount = groupResults.reduce((a, r) => a + r.playerCount, 0);
@@ -697,7 +773,7 @@ function extractBlessings(playerBuffs) {
 // of just using a Preset. simProfileChoice is pre-picked from whatever hint is available, falling
 // back to the class's default; the dropdown (only shown for genuinely ambiguous roles) lets the
 // user override it. Blessings default to whatever the uploaded JSON already specified, if any.
-function parseBuffContributor(rawJson, name) {
+function parseBuffContributor(rawJson, filenameFallback) {
   if (!rawJson || typeof rawJson !== "object" || !rawJson.player || typeof rawJson.player !== "object") {
     throw new Error("uploaded JSON has no 'player' field");
   }
@@ -716,7 +792,10 @@ function parseBuffContributor(rawJson, name) {
   const hint = detectSpecHint(player);
   const defaultSpec = (hint && compatibleSpecs.includes(hint)) ? hint : (compatibleSpecs[0] || null);
   return {
-    name: (name || player.name || "unnamed").slice(0, 60),
+    // The JSON's own declared name wins - that's what the person actually typed for this
+    // character/build, which may differ from whatever the file happens to be named on disk
+    // (e.g. after multiple re-downloads). Filename is just a fallback if the JSON has no name at all.
+    name: ((typeof player.name === "string" && player.name.trim()) || filenameFallback || "unnamed").slice(0, 60),
     class: player.class,
     capabilities,
     rawJson, // kept so we can re-parse against whichever spec the user picks for personal DPS
@@ -1306,33 +1385,30 @@ function OptimizerMode() {
 
   // Custom profiles that are ready to contribute personal DPS (a sim profile was picked and the
   // resim has actually completed) are automatically part of this pool - each one is a specific
-  // named person, so unlike presets they're always included at exactly 1, not a variable count.
+  // named person, so unlike presets they're always included at exactly 1, not a variable count -
+  // but same as presets, the user chooses whether they're actually in this pool via a toggle.
   const activeContributors = useMemo(
     () => buffContributors.filter((c) => c.simProfileChoice && factors[c.id]),
     [buffContributors, factors]
   );
+  const [includedContributorIds, setIncludedContributorIds] = useState(new Set());
+  const toggleContributorIncluded = (id) => {
+    setIncludedContributorIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+    markStale();
+  };
+  const poolContributors = useMemo(
+    () => activeContributors.filter((c) => includedContributorIds.has(c.id)),
+    [activeContributors, includedContributorIds]
+  );
 
   const totalLocked = useMemo(() => Object.values(counts).reduce((a, b) => a + b, 0) + restoCount, [counts, restoCount]);
   const capacity = numGroups * 5;
-  const contributorCapacity = Math.min(activeContributors.length, capacity);
+  const contributorCapacity = Math.min(poolContributors.length, capacity);
   const overflow = totalLocked > capacity - contributorCapacity;
-
-  // Round-robin distribution of active custom profiles across groups, filling each group's 5 slots
-  // before moving to the next - this is a reasonable placement, not a jointly-optimal one (it doesn't
-  // consider which group benefits most from a given profile's buffs). Manual Builder gives full
-  // control if a specific placement matters.
-  const namedEntriesPerGroup = useMemo(() => {
-    const perGroup = Array.from({ length: committed?.numGroups || 1 }, () => []);
-    if (!committed) return perGroup;
-    let g = 0;
-    for (const c of activeContributors) {
-      while (perGroup[g] && perGroup[g].length >= 5) g++;
-      if (g >= perGroup.length) break; // no more room anywhere
-      perGroup[g].push({ id: c.id, name: c.name });
-      g = (g + 1) % perGroup.length;
-    }
-    return perGroup;
-  }, [committed, activeContributors]);
 
   const results = useMemo(() => {
     if (!committed || committed.overflow) return null;
@@ -1341,8 +1417,8 @@ function OptimizerMode() {
     const cleanCounts = { ...committed.counts };
     for (const specId of excludedPresets) cleanCounts[specId] = 0;
     const pool = { ...cleanCounts, resto_shaman: committed.restoCount };
-    return allocateRaid(pool, committed.numGroups, committed.objective, factors, excludedPresets, namedEntriesPerGroup);
-  }, [committed, factors, excludedPresets, namedEntriesPerGroup]);
+    return allocateRaid(pool, committed.numGroups, committed.objective, factors, excludedPresets, committed.poolContributors);
+  }, [committed, factors, excludedPresets]);
 
   const markStale = () => setStale(true);
   const updateCount = (id, delta) => { setCounts((prev) => ({ ...prev, [id]: Math.max(0, prev[id] + delta) })); markStale(); };
@@ -1351,7 +1427,7 @@ function OptimizerMode() {
   const changeObjective = (v) => { setObjective(v); markStale(); };
 
   const computeResults = () => {
-    setCommitted({ counts: { ...counts }, restoCount, numGroups, objective, overflow });
+    setCommitted({ counts: { ...counts }, restoCount, numGroups, objective, overflow, poolContributors });
     setStale(false);
   };
 
@@ -1367,7 +1443,7 @@ function OptimizerMode() {
     if (!top) return null;
     const svGroup = top.groupResults.find((r) => r.lockedCounts.survival_hunter > 0);
     const raidWideEW = svGroup ? { agility: EW_BASE_AGILITY + survivalHunterAgilityBump(svGroup.state.shaman), uptime: EW_UPTIME_DEFAULT } : null;
-    return top.groupResults.map((r) => bestFill(r.lockedCounts, r.lockedResto, r.remaining, excludeHunters, raidWideEW, factors, excludedPresets, r.namedEntries));
+    return top.groupResults.map((r) => bestFill(r.lockedCounts, r.lockedResto, r.remaining, excludeHunters, raidWideEW, factors, excludedPresets, r.namedEntries, r.extraBuffs));
   }, [top, excludeHunters, factors, excludedPresets]);
 
   return (
@@ -1385,10 +1461,10 @@ function OptimizerMode() {
         combinations and stays within about 0.3% of the real result.
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: "10px", marginBottom: "16px" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: "10px", marginBottom: "16px" }}>
         {SPEC_LIST.filter((spec) => !excludedPresets.has(spec.id)).map((spec) => (
-          <div key={spec.id} style={{ background: "#1a1a1a", border: "1px solid #333", borderRadius: "6px", padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-            <span style={{ fontSize: "13px" }}>{specDisplayLabel(spec.id, spec.label, profileMeta)}</span>
+          <div key={spec.id} style={{ background: "#1a1a1a", border: "1px solid #333", borderRadius: "6px", padding: "10px 12px", display: "flex", flexDirection: "column", alignItems: "center", gap: "8px" }}>
+            <span style={{ fontSize: "13px", textAlign: "center" }}>{specDisplayLabel(spec.id, spec.label, profileMeta)}</span>
             <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
               <button onClick={() => updateCount(spec.id, -1)} style={{ width: "22px", height: "22px", borderRadius: "4px", border: "1px solid #444", background: "#252525", color: "#ccc", cursor: "pointer", fontSize: "14px", lineHeight: 1 }}>-</button>
               <span style={{ minWidth: "16px", textAlign: "center", fontWeight: 600 }}>{counts[spec.id]}</span>
@@ -1396,14 +1472,27 @@ function OptimizerMode() {
             </div>
           </div>
         ))}
-        <div style={{ background: "#1a1a1a", border: "1px solid #333", borderRadius: "6px", padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <span style={{ fontSize: "13px" }}>Resto shaman</span>
+        <div style={{ background: "#1a1a1a", border: "1px solid #333", borderRadius: "6px", padding: "10px 12px", display: "flex", flexDirection: "column", alignItems: "center", gap: "8px" }}>
+          <span style={{ fontSize: "13px", textAlign: "center" }}>Resto shaman</span>
           <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
             <button onClick={() => changeResto(-1)} style={{ width: "22px", height: "22px", borderRadius: "4px", border: "1px solid #444", background: "#252525", color: "#ccc", cursor: "pointer", fontSize: "14px", lineHeight: 1 }}>-</button>
             <span style={{ minWidth: "16px", textAlign: "center", fontWeight: 600 }}>{restoCount}</span>
             <button onClick={() => changeResto(1)} style={{ width: "22px", height: "22px", borderRadius: "4px", border: "1px solid #444", background: "#252525", color: "#ccc", cursor: "pointer", fontSize: "14px", lineHeight: 1 }}>+</button>
           </div>
         </div>
+        {activeContributors.map((c) => {
+          const included = includedContributorIds.has(c.id);
+          return (
+            <div key={c.id} style={{ background: included ? "#12202b" : "#1a1a1a", border: "1px solid " + (included ? "#2c6a8e" : "#333"), borderRadius: "6px", padding: "10px 12px", display: "flex", flexDirection: "column", alignItems: "center", gap: "8px" }}>
+              <span style={{ fontSize: "13px", textAlign: "center", color: included ? "#7ec1f0" : "#e8e8e8" }}>{c.name}</span>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <button onClick={() => included && toggleContributorIncluded(c.id)} disabled={!included} style={{ width: "22px", height: "22px", borderRadius: "4px", border: "1px solid #444", background: "#252525", color: included ? "#ccc" : "#555", cursor: included ? "pointer" : "not-allowed", fontSize: "14px", lineHeight: 1 }}>-</button>
+                <span style={{ minWidth: "16px", textAlign: "center", fontWeight: 600 }}>{included ? 1 : 0}</span>
+                <button onClick={() => !included && toggleContributorIncluded(c.id)} disabled={included} style={{ width: "22px", height: "22px", borderRadius: "4px", border: "1px solid #444", background: "#252525", color: !included ? "#ccc" : "#555", cursor: !included ? "pointer" : "not-allowed", fontSize: "14px", lineHeight: 1 }}>+</button>
+              </div>
+            </div>
+          );
+        })}
       </div>
 
       {excludedPresets.size > 0 && (
@@ -1411,21 +1500,6 @@ function OptimizerMode() {
           {excludedPresets.size} preset{excludedPresets.size > 1 ? "s" : ""} hidden here (not kept in sync with current
           settings, so their DPS can't be trusted for optimizing - see Profiles &amp; settings to re-include).
         </p>
-      )}
-
-      {activeContributors.length > 0 && (
-        <div style={{ background: "#1a1a1a", border: "1px solid #333", borderRadius: "6px", padding: "10px 14px", marginBottom: "16px" }}>
-          <div style={{ fontSize: "12px", color: "#aaa", marginBottom: "6px" }}>
-            Custom profiles automatically included ({activeContributors.length} slot{activeContributors.length > 1 ? "s" : ""} reserved):
-          </div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
-            {activeContributors.map((c) => (
-              <span key={c.id} style={{ fontSize: "11px", color: "#7ec1f0", background: "#12202b", border: "1px solid #2c4a5e", borderRadius: "4px", padding: "3px 8px" }}>
-                {c.name}
-              </span>
-            ))}
-          </div>
-        </div>
       )}
 
       <div style={{ display: "flex", alignItems: "center", gap: "18px", marginBottom: "14px", flexWrap: "wrap" }}>
