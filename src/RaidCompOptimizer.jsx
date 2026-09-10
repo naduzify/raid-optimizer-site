@@ -96,14 +96,21 @@ function evaluateGroup(counts, restoAgi, restoWf, ewState, factors, extraBuffs, 
       breakdown.push({ id: spec.id, label: spec.label, count: n, dpsEach: dps, pctEach: mult - 1 });
     }
   }
-  // named buff contributors that also have a resimmed personal factor table (user picked a sim profile for them)
+  // named buff contributors that also have a resimmed personal factor table (user picked a sim profile
+  // for them) - merged by id first since the same contributor can now appear more than once (a raid
+  // leader with several identical-build raiders, from one uploaded profile with count > 1).
+  const namedCounts = new Map(); // id -> { name, count }
   for (const entry of namedDpsEntries || []) {
     if (!factors[entry.id]) continue; // resim hasn't completed yet
-    const mult = buffMultiplier(entry.id, state, factors);
-    const dps = factors[entry.id].base * mult;
-    total += dps;
-    pctSum += mult - 1;
-    breakdown.push({ id: entry.id, label: entry.name, count: 1, dpsEach: dps, pctEach: mult - 1 });
+    if (!namedCounts.has(entry.id)) namedCounts.set(entry.id, { name: entry.name, count: 0 });
+    namedCounts.get(entry.id).count += 1;
+  }
+  for (const [id, { name, count }] of namedCounts) {
+    const mult = buffMultiplier(id, state, factors);
+    const dps = factors[id].base * mult;
+    total += dps * count;
+    pctSum += (mult - 1) * count;
+    breakdown.push({ id, label: name, count, dpsEach: dps, pctEach: mult - 1 });
   }
   const playerCount = breakdown.reduce((s, b) => s + b.count, 0);
   return { total, pctSum, playerCount, breakdown, state };
@@ -1384,26 +1391,25 @@ function OptimizerMode() {
   const [stale, setStale] = useState(false); // true when inputs changed since last compute
 
   // Custom profiles that are ready to contribute personal DPS (a sim profile was picked and the
-  // resim has actually completed) are automatically part of this pool - each one is a specific
-  // named person, so unlike presets they're always included at exactly 1, not a variable count -
-  // but same as presets, the user chooses whether they're actually in this pool via a toggle.
+  // resim has actually completed) are available in this pool - same as presets, the user picks how
+  // many of each (e.g. 3 raiders who all happen to have this exact same gear/build uploaded once).
   const activeContributors = useMemo(
     () => buffContributors.filter((c) => c.simProfileChoice && factors[c.id]),
     [buffContributors, factors]
   );
-  const [includedContributorIds, setIncludedContributorIds] = useState(new Set());
-  const toggleContributorIncluded = (id) => {
-    setIncludedContributorIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
+  const [contributorCounts, setContributorCounts] = useState({});
+  const updateContributorCount = (id, delta) => {
+    setContributorCounts((prev) => ({ ...prev, [id]: Math.max(0, (prev[id] || 0) + delta) }));
     markStale();
   };
-  const poolContributors = useMemo(
-    () => activeContributors.filter((c) => includedContributorIds.has(c.id)),
-    [activeContributors, includedContributorIds]
-  );
+  const poolContributors = useMemo(() => {
+    const list = [];
+    for (const c of activeContributors) {
+      const n = contributorCounts[c.id] || 0;
+      for (let i = 0; i < n; i++) list.push(c);
+    }
+    return list;
+  }, [activeContributors, contributorCounts]);
 
   const totalLocked = useMemo(() => Object.values(counts).reduce((a, b) => a + b, 0) + restoCount, [counts, restoCount]);
   const capacity = numGroups * 5;
@@ -1481,19 +1487,21 @@ function OptimizerMode() {
           </div>
         </div>
         {activeContributors.map((c) => {
-          const included = includedContributorIds.has(c.id);
+          const count = contributorCounts[c.id] || 0;
+          const included = count > 0;
           return (
             <div key={c.id} style={{ background: included ? "#12202b" : "#1a1a1a", border: "1px solid " + (included ? "#2c6a8e" : "#333"), borderRadius: "6px", padding: "10px 12px", display: "flex", flexDirection: "column", alignItems: "center", gap: "8px" }}>
               <span style={{ fontSize: "13px", textAlign: "center", color: included ? "#7ec1f0" : "#e8e8e8" }}>{c.name}</span>
               <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-                <button onClick={() => included && toggleContributorIncluded(c.id)} disabled={!included} style={{ width: "22px", height: "22px", borderRadius: "4px", border: "1px solid #444", background: "#252525", color: included ? "#ccc" : "#555", cursor: included ? "pointer" : "not-allowed", fontSize: "14px", lineHeight: 1 }}>-</button>
-                <span style={{ minWidth: "16px", textAlign: "center", fontWeight: 600 }}>{included ? 1 : 0}</span>
-                <button onClick={() => !included && toggleContributorIncluded(c.id)} disabled={included} style={{ width: "22px", height: "22px", borderRadius: "4px", border: "1px solid #444", background: "#252525", color: !included ? "#ccc" : "#555", cursor: !included ? "pointer" : "not-allowed", fontSize: "14px", lineHeight: 1 }}>+</button>
+                <button onClick={() => updateContributorCount(c.id, -1)} style={{ width: "22px", height: "22px", borderRadius: "4px", border: "1px solid #444", background: "#252525", color: "#ccc", cursor: "pointer", fontSize: "14px", lineHeight: 1 }}>-</button>
+                <span style={{ minWidth: "16px", textAlign: "center", fontWeight: 600 }}>{count}</span>
+                <button onClick={() => updateContributorCount(c.id, 1)} style={{ width: "22px", height: "22px", borderRadius: "4px", border: "1px solid #444", background: "#252525", color: "#ccc", cursor: "pointer", fontSize: "14px", lineHeight: 1 }}>+</button>
               </div>
             </div>
           );
         })}
       </div>
+
 
       {excludedPresets.size > 0 && (
         <p style={{ fontSize: "11px", color: "#777", marginTop: "-10px", marginBottom: "14px" }}>
@@ -1525,7 +1533,6 @@ function OptimizerMode() {
         </label>
         <span style={{ fontSize: "13px", color: overflow ? "#e05c5c" : "#aaa" }}>
           {totalLocked}/{capacity - contributorCapacity} players placed
-          {contributorCapacity > 0 ? ` (+${contributorCapacity} reserved for custom profiles)` : ""}
         </span>
       </div>
 
@@ -1547,7 +1554,7 @@ function OptimizerMode() {
       {overflow && (
         <div style={{ display: "flex", gap: "8px", alignItems: "center", background: "#3a1f1f", border: "1px solid #6b2c2c", borderRadius: "6px", padding: "10px 14px", color: "#e0a0a0", fontSize: "13px", marginBottom: "14px" }}>
           <AlertTriangle size={16} />
-          {totalLocked} players won't fit in {numGroups} group{numGroups > 1 ? "s" : ""} ({capacity} slots{contributorCapacity > 0 ? `, ${contributorCapacity} already reserved for custom profiles` : ""}) - remove some or add another group.
+          {totalLocked} players won't fit in {numGroups} group{numGroups > 1 ? "s" : ""} ({capacity} slots) - remove some or add another group.
         </div>
       )}
 
@@ -1761,10 +1768,21 @@ function SettingsPanel() {
     }
   };
 
+  // These uploads accept either a flat file containing just the relevant object, or a full export
+  // (the same "IndividualSimSettings"-style format used for custom profiles, with raidBuffs/debuffs/
+  // encounter/partyBuffs/player all as siblings) - the same one file exported from wowsims already
+  // works for a profile upload AND for pulling out just its encounter or debuffs, no manual editing needed.
+  const extractSubObject = (json, key) => {
+    if (json && typeof json === "object" && json[key] && typeof json[key] === "object" && !Array.isArray(json[key])) {
+      return json[key];
+    }
+    return json;
+  };
+
   const handleEncounterUpload = async (file) => {
     setUploadError(null);
     try {
-      const json = await readUploadedJson(file);
+      const json = extractSubObject(await readUploadedJson(file), "encounter");
       validateEncounterUpload(json);
       setDraftEncounterOverride(json);
       setSettingsDirty(true);
@@ -1776,7 +1794,7 @@ function SettingsPanel() {
   const handleDebuffsUpload = async (file) => {
     setUploadError(null);
     try {
-      const json = await readUploadedJson(file);
+      const json = extractSubObject(await readUploadedJson(file), "debuffs");
       validateFlatBuffObject(json, "debuffs");
       setDraftDebuffs(json);
       setSettingsDirty(true);
@@ -1788,7 +1806,7 @@ function SettingsPanel() {
   const handleRaidBuffsUpload = async (file) => {
     setUploadError(null);
     try {
-      const json = await readUploadedJson(file);
+      const json = extractSubObject(await readUploadedJson(file), "raidBuffs");
       validateFlatBuffObject(json, "raid buffs");
       setDraftRaidBuffs(json);
       setSettingsDirty(true);
