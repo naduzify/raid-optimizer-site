@@ -66,7 +66,10 @@ function restoVariantToFlags(label) {
 // Its magnitude depends on the survival hunter's own agility, which is higher if THEIR OWN group
 // gives them an agi totem - so unlike other buffs this can't be auto-detected from a single group's
 // own counts. Callers must compute and pass the correct ewState (see computeRaidWideEW below).
-function evaluateGroup(counts, restoAgi, restoWf, ewState, factors, extraBuffs, namedDpsEntries) {
+const EMPTY_SET = new Set();
+
+function evaluateGroup(counts, restoAgi, restoWf, ewState, factors, extraBuffs, namedDpsEntries, excludedPresets) {
+  const excluded = excludedPresets || EMPTY_SET;
   const extra = extraBuffs || { warrior: false, ret: false, feral: false, fi: 0, shaman: null };
   const state = {
     warrior: counts.fury_warrior + counts.kebab_warrior + counts.arms2h_warrior > 0 || extra.warrior,
@@ -82,6 +85,10 @@ function evaluateGroup(counts, restoAgi, restoWf, ewState, factors, extraBuffs, 
   for (const spec of SPEC_LIST) {
     const n = counts[spec.id];
     if (n > 0) {
+      // A preset excluded from "apply & resim all" isn't kept in sync with current settings, so we
+      // can't vouch for its DPS number anymore - it still contributes whatever buffs it always did
+      // (that's derived from raw counts above, unaffected by this), it just stops counting as DPS.
+      if (excluded.has(spec.id)) continue;
       const mult = buffMultiplier(spec.id, state, factors);
       const dps = factors[spec.id].base * mult;
       total += dps * n;
@@ -109,7 +116,7 @@ function restoVariantsFor(restoCount) {
 }
 
 // best way to fill a group's remaining open slots given what's already fixed in it
-function bestFill(lockedCounts, restoCountLocked, remaining, excludeHunters, ewOverride, factors) {
+function bestFill(lockedCounts, restoCountLocked, remaining, excludeHunters, ewOverride, factors, excludedPresets, namedDpsEntries) {
   const fills = [];
   function recurse(slotsLeft, addCounts, restoAdded) {
     if (slotsLeft === 0) {
@@ -119,6 +126,7 @@ function bestFill(lockedCounts, restoCountLocked, remaining, excludeHunters, ewO
     for (const spec of SPEC_LIST) {
       const isHunter = spec.id === "bm_hunter" || spec.id === "survival_hunter";
       if (excludeHunters && isHunter) continue;
+      if (excludedPresets && excludedPresets.has(spec.id)) continue; // not kept in sync with current settings - don't suggest it as a DPS addition
       addCounts[spec.id] = (addCounts[spec.id] || 0) + 1;
       recurse(slotsLeft - 1, addCounts, restoAdded);
       addCounts[spec.id] -= 1;
@@ -134,7 +142,7 @@ function bestFill(lockedCounts, restoCountLocked, remaining, excludeHunters, ewO
     for (const k in fill.addCounts) finalCounts[k] = (finalCounts[k] || 0) + fill.addCounts[k];
     const totalResto = restoCountLocked + fill.restoAdded;
     for (const v of restoVariantsFor(totalResto)) {
-      const evalResult = evaluateGroup(finalCounts, v.a, v.w, ewOverride, factors);
+      const evalResult = evaluateGroup(finalCounts, v.a, v.w, ewOverride, factors, undefined, namedDpsEntries, excludedPresets);
       if (!best || evalResult.total > best.total) {
         best = { finalCounts, restoCount: totalResto, restoVariant: v.label, ...evalResult };
       }
@@ -144,10 +152,10 @@ function bestFill(lockedCounts, restoCountLocked, remaining, excludeHunters, ewO
 }
 
 // evaluate a group using ONLY the locked units already placed - no filling of empty slots
-function evaluateLockedOnly(lockedCounts, restoCountLocked, objective, ewOverride, factors) {
+function evaluateLockedOnly(lockedCounts, restoCountLocked, objective, ewOverride, factors, excludedPresets, namedDpsEntries) {
   let best = null;
   for (const v of restoVariantsFor(restoCountLocked)) {
-    const evalResult = evaluateGroup(lockedCounts, v.a, v.w, ewOverride, factors);
+    const evalResult = evaluateGroup(lockedCounts, v.a, v.w, ewOverride, factors, undefined, namedDpsEntries, excludedPresets);
     const score =
       objective === "total" ? evalResult.total :
       objective === "avg_pct" ? evalResult.pctSum :
@@ -200,11 +208,12 @@ const CATEGORY_STAGES = [
   ["ret_paladin"],
 ];
 
-function allocateRaid(pool, numGroups, objective, factors) {  const MAX_STATES = 4000;
+function allocateRaid(pool, numGroups, objective, factors, excludedPresets, namedEntriesPerGroup) {  const MAX_STATES = 4000;
+  const namedPerGroup = namedEntriesPerGroup || Array.from({ length: numGroups }, () => []);
   let states = [{
     perGroupCounts: Array.from({ length: numGroups }, () => Object.fromEntries(SPEC_LIST.map((s) => [s.id, 0]))),
     perGroupResto: Array(numGroups).fill(0),
-    caps: Array(numGroups).fill(5),
+    caps: Array.from({ length: numGroups }, (_, g) => 5 - namedPerGroup[g].length),
   }];
 
   for (const stage of CATEGORY_STAGES) {
@@ -254,7 +263,7 @@ function allocateRaid(pool, numGroups, objective, factors) {  const MAX_STATES =
         const svIdx = svGroupIdxs.indexOf(i);
         const variantLabel = svIdx >= 0 ? combo[svIdx] : r.restoVariant;
         const [a, w] = restoVariantToFlags(variantLabel);
-        const ev = evaluateGroup(r.finalCounts, a, w, ewState, factors);
+        const ev = evaluateGroup(r.finalCounts, a, w, ewState, factors, undefined, namedPerGroup[i], excludedPresets);
         const score = objective === "total" ? ev.total : objective === "avg_pct" ? ev.pctSum : (ev.breakdown.find((b) => b.id === objective)?.dpsEach ?? -1);
         return { ...r, restoVariant: variantLabel, ...ev, score };
       });
@@ -271,9 +280,9 @@ function allocateRaid(pool, numGroups, objective, factors) {  const MAX_STATES =
     let groupResults = [];
     let feasible = true;
     for (let g = 0; g < numGroups; g++) {
-      const fill = evaluateLockedOnly(st.perGroupCounts[g], st.perGroupResto[g], objective, null, factors);
+      const fill = evaluateLockedOnly(st.perGroupCounts[g], st.perGroupResto[g], objective, null, factors, excludedPresets, namedPerGroup[g]);
       if (!fill) { feasible = false; break; }
-      groupResults.push({ ...fill, lockedCounts: st.perGroupCounts[g], lockedResto: st.perGroupResto[g], remaining: st.caps[g] });
+      groupResults.push({ ...fill, lockedCounts: st.perGroupCounts[g], lockedResto: st.perGroupResto[g], remaining: st.caps[g], namedEntries: namedPerGroup[g] });
     }
     if (!feasible) continue;
     groupResults = correctForSurvivalHunterAgility(groupResults, objective);
@@ -1120,13 +1129,13 @@ function computeManualRaidWideEW(groupSlotsArray, fallbackOverride) {
   return maxAgility !== null ? { agility: maxAgility, uptime: EW_UPTIME_DEFAULT } : fallbackOverride;
 }
 
-function evalSlots(slots, ewOverride, factors, buffContributors) {
+function evalSlots(slots, ewOverride, factors, buffContributors, excludedPresets) {
   const { counts, restoAgi, restoWf, extraBuffs, namedDpsEntries } = slotsToCounts(slots, buffContributors);
-  return evaluateGroup(counts, restoAgi, restoWf, ewOverride, factors, extraBuffs, namedDpsEntries);
+  return evaluateGroup(counts, restoAgi, restoWf, ewOverride, factors, extraBuffs, namedDpsEntries, excludedPresets);
 }
 
 function ManualBuilder() {
-  const { factors, profileMeta, buffContributors } = useAppContext();
+  const { factors, profileMeta, buffContributors, excludedPresets } = useAppContext();
   const [numGroups, setNumGroups] = useState(1);
   const [groupSlots, setGroupSlots] = useState([Array(5).fill("empty")]);
   const [assumeSvHunter, setAssumeSvHunter] = useState(false);
@@ -1150,7 +1159,7 @@ function ManualBuilder() {
   const assumedOverride = assumeSvHunter ? { agility: assumedAgility, uptime: assumedUptime / 100 } : null;
   const ewOverride = computeManualRaidWideEW(groupSlots, assumedOverride);
 
-  const groupEvals = groupSlots.map((slots) => evalSlots(slots, ewOverride, factors, buffContributors));
+  const groupEvals = groupSlots.map((slots) => evalSlots(slots, ewOverride, factors, buffContributors, excludedPresets));
   const raidTotal = groupEvals.reduce((a, e) => a + e.total, 0);
 
   return (
@@ -1242,7 +1251,7 @@ function ManualBuilder() {
                 {slots.map((val, sIdx) => {
                   const withoutSlots = [...slots];
                   withoutSlots[sIdx] = "empty";
-                  const withoutTotal = evalSlots(withoutSlots, ewOverride, factors, buffContributors).total;
+                  const withoutTotal = evalSlots(withoutSlots, ewOverride, factors, buffContributors, excludedPresets).total;
                   const marginal = evalResult.total - withoutTotal;
                   const specMeta = SPEC_LIST.find((s) => s.id === val);
                   const lookupId = typeof val === "string" && val.startsWith("contrib:") ? val.slice(8) : val;
@@ -1284,7 +1293,7 @@ function ManualBuilder() {
 }
 
 function OptimizerMode() {
-  const { factors, profileMeta } = useAppContext();
+  const { factors, profileMeta, excludedPresets, buffContributors } = useAppContext();
   const emptyCounts = () => Object.fromEntries(SPEC_LIST.map((s) => [s.id, 0]));
   const [counts, setCounts] = useState(emptyCounts());
   const [restoCount, setRestoCount] = useState(0);
@@ -1295,15 +1304,45 @@ function OptimizerMode() {
   const [committed, setCommitted] = useState(null); // snapshot used for computation
   const [stale, setStale] = useState(false); // true when inputs changed since last compute
 
+  // Custom profiles that are ready to contribute personal DPS (a sim profile was picked and the
+  // resim has actually completed) are automatically part of this pool - each one is a specific
+  // named person, so unlike presets they're always included at exactly 1, not a variable count.
+  const activeContributors = useMemo(
+    () => buffContributors.filter((c) => c.simProfileChoice && factors[c.id]),
+    [buffContributors, factors]
+  );
+
   const totalLocked = useMemo(() => Object.values(counts).reduce((a, b) => a + b, 0) + restoCount, [counts, restoCount]);
   const capacity = numGroups * 5;
-  const overflow = totalLocked > capacity;
+  const contributorCapacity = Math.min(activeContributors.length, capacity);
+  const overflow = totalLocked > capacity - contributorCapacity;
+
+  // Round-robin distribution of active custom profiles across groups, filling each group's 5 slots
+  // before moving to the next - this is a reasonable placement, not a jointly-optimal one (it doesn't
+  // consider which group benefits most from a given profile's buffs). Manual Builder gives full
+  // control if a specific placement matters.
+  const namedEntriesPerGroup = useMemo(() => {
+    const perGroup = Array.from({ length: committed?.numGroups || 1 }, () => []);
+    if (!committed) return perGroup;
+    let g = 0;
+    for (const c of activeContributors) {
+      while (perGroup[g] && perGroup[g].length >= 5) g++;
+      if (g >= perGroup.length) break; // no more room anywhere
+      perGroup[g].push({ id: c.id, name: c.name });
+      g = (g + 1) % perGroup.length;
+    }
+    return perGroup;
+  }, [committed, activeContributors]);
 
   const results = useMemo(() => {
     if (!committed || committed.overflow) return null;
-    const pool = { ...committed.counts, resto_shaman: committed.restoCount };
-    return allocateRaid(pool, committed.numGroups, committed.objective, factors);
-  }, [committed, factors]);
+    // Excluded presets are hidden from this pool entirely - zero their counts even if some were
+    // set before they became excluded, so a stale count can't silently sneak into the search.
+    const cleanCounts = { ...committed.counts };
+    for (const specId of excludedPresets) cleanCounts[specId] = 0;
+    const pool = { ...cleanCounts, resto_shaman: committed.restoCount };
+    return allocateRaid(pool, committed.numGroups, committed.objective, factors, excludedPresets, namedEntriesPerGroup);
+  }, [committed, factors, excludedPresets, namedEntriesPerGroup]);
 
   const markStale = () => setStale(true);
   const updateCount = (id, delta) => { setCounts((prev) => ({ ...prev, [id]: Math.max(0, prev[id] + delta) })); markStale(); };
@@ -1328,8 +1367,8 @@ function OptimizerMode() {
     if (!top) return null;
     const svGroup = top.groupResults.find((r) => r.lockedCounts.survival_hunter > 0);
     const raidWideEW = svGroup ? { agility: EW_BASE_AGILITY + survivalHunterAgilityBump(svGroup.state.shaman), uptime: EW_UPTIME_DEFAULT } : null;
-    return top.groupResults.map((r) => bestFill(r.lockedCounts, r.lockedResto, r.remaining, excludeHunters, raidWideEW, factors));
-  }, [top, excludeHunters, factors]);
+    return top.groupResults.map((r) => bestFill(r.lockedCounts, r.lockedResto, r.remaining, excludeHunters, raidWideEW, factors, excludedPresets, r.namedEntries));
+  }, [top, excludeHunters, factors, excludedPresets]);
 
   return (
     <div style={{ background: "#121212", color: "#e8e8e8", padding: "24px", borderRadius: "8px", fontFamily: "system-ui, sans-serif", maxWidth: "100%" }}>
@@ -1347,7 +1386,7 @@ function OptimizerMode() {
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: "10px", marginBottom: "16px" }}>
-        {SPEC_LIST.map((spec) => (
+        {SPEC_LIST.filter((spec) => !excludedPresets.has(spec.id)).map((spec) => (
           <div key={spec.id} style={{ background: "#1a1a1a", border: "1px solid #333", borderRadius: "6px", padding: "10px 12px", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
             <span style={{ fontSize: "13px" }}>{specDisplayLabel(spec.id, spec.label, profileMeta)}</span>
             <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
@@ -1366,6 +1405,28 @@ function OptimizerMode() {
           </div>
         </div>
       </div>
+
+      {excludedPresets.size > 0 && (
+        <p style={{ fontSize: "11px", color: "#777", marginTop: "-10px", marginBottom: "14px" }}>
+          {excludedPresets.size} preset{excludedPresets.size > 1 ? "s" : ""} hidden here (not kept in sync with current
+          settings, so their DPS can't be trusted for optimizing - see Profiles &amp; settings to re-include).
+        </p>
+      )}
+
+      {activeContributors.length > 0 && (
+        <div style={{ background: "#1a1a1a", border: "1px solid #333", borderRadius: "6px", padding: "10px 14px", marginBottom: "16px" }}>
+          <div style={{ fontSize: "12px", color: "#aaa", marginBottom: "6px" }}>
+            Custom profiles automatically included ({activeContributors.length} slot{activeContributors.length > 1 ? "s" : ""} reserved):
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+            {activeContributors.map((c) => (
+              <span key={c.id} style={{ fontSize: "11px", color: "#7ec1f0", background: "#12202b", border: "1px solid #2c4a5e", borderRadius: "4px", padding: "3px 8px" }}>
+                {c.name}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div style={{ display: "flex", alignItems: "center", gap: "18px", marginBottom: "14px", flexWrap: "wrap" }}>
         <label style={{ fontSize: "13px", color: "#aaa", display: "flex", alignItems: "center", gap: "6px" }}>
@@ -1389,7 +1450,8 @@ function OptimizerMode() {
           </select>
         </label>
         <span style={{ fontSize: "13px", color: overflow ? "#e05c5c" : "#aaa" }}>
-          {totalLocked}/{capacity} players placed
+          {totalLocked}/{capacity - contributorCapacity} players placed
+          {contributorCapacity > 0 ? ` (+${contributorCapacity} reserved for custom profiles)` : ""}
         </span>
       </div>
 
@@ -1411,7 +1473,7 @@ function OptimizerMode() {
       {overflow && (
         <div style={{ display: "flex", gap: "8px", alignItems: "center", background: "#3a1f1f", border: "1px solid #6b2c2c", borderRadius: "6px", padding: "10px 14px", color: "#e0a0a0", fontSize: "13px", marginBottom: "14px" }}>
           <AlertTriangle size={16} />
-          {totalLocked} players won't fit in {numGroups} group{numGroups > 1 ? "s" : ""} ({capacity} slots) - remove some or add another group.
+          {totalLocked} players won't fit in {numGroups} group{numGroups > 1 ? "s" : ""} ({capacity} slots{contributorCapacity > 0 ? `, ${contributorCapacity} already reserved for custom profiles` : ""}) - remove some or add another group.
         </div>
       )}
 
