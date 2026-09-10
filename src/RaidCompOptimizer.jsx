@@ -1,5 +1,5 @@
 import { useState, useMemo, useEffect, createContext, useContext, useCallback } from "react";
-import { Swords, Trophy, AlertTriangle, Upload, Settings } from "lucide-react";
+import { Swords, Trophy, AlertTriangle, Upload, Settings, Loader2 } from "lucide-react";
 
 const PRESET_FACTORS = {"fury_warrior": {"base": 1485.8, "bshout": 1.00123, "sanc": 1.02179, "lotp": 1.05954, "enh": 1.27491, "restoA": 1.07431, "restoB": 1.14263, "restoAB": 1.17697, "fi": [1.0, 1.03299, 1.06448, 1.09751, 1.1353, 1.16826], "ewCoef": 5.9113e-05}, "kebab_warrior": {"base": 1199.5, "bshout": 1.00352, "sanc": 1.02389, "lotp": 1.05704, "enh": 1.26015, "restoA": 1.0693, "restoB": 1.14561, "restoAB": 1.17506, "fi": [1.0, 1.03471, 1.06892, 1.10124, 1.13331, 1.16672], "ewCoef": 5.728e-05}, "arms2h_warrior": {"base": 1371.2, "bshout": 1.00724, "sanc": 1.02072, "lotp": 1.04864, "enh": 1.27558, "restoA": 1.0644, "restoB": 1.16101, "restoAB": 1.18973, "fi": [1.0, 1.03181, 1.07029, 1.10426, 1.14069, 1.1739], "ewCoef": 5.443e-05}, "bm_hunter": {"base": 2413.6, "bshout": 1.04643, "sanc": 1.01975, "lotp": 1.0502, "enh": 1.10147, "restoA": 1.0549, "restoB": 1.03132, "restoAB": 1.06796, "fi": [1.0, 1.02963, 1.05925, 1.08888, 1.11851, 1.14813], "ewCoef": 6.3715e-05}, "survival_hunter": {"base": 2189.0, "bshout": 1.03262, "sanc": 1.01976, "lotp": 1.04876, "enh": 1.09993, "restoA": 1.04869, "restoB": 1.03222, "restoAB": 1.0702, "fi": [1.0, 1.02964, 1.05928, 1.08892, 1.11856, 1.1482], "ewCoef": 0.0}, "rogue": {"base": 1459.6, "bshout": 1.07879, "sanc": 1.01967, "lotp": 1.03906, "enh": 1.21558, "restoA": 1.05283, "restoB": 1.10672, "restoAB": 1.14311, "fi": [1.0, 1.0295, 1.059, 1.08851, 1.11801, 1.14751], "ewCoef": 5.4976e-05}, "enhance_shaman": {"base": 1906.3, "bshout": 1.07261, "sanc": 1.01756, "lotp": 1.03495, "enh": 1.00674, "restoA": 1.00524, "restoB": 0.99986, "restoAB": 1.00514, "fi": [1.0, 1.02634, 1.05269, 1.07903, 1.10538, 1.13172], "ewCoef": 4.8003e-05}, "feral_tank": {"base": 791.6, "bshout": 1.07989, "sanc": 1.02012, "lotp": 1.0, "enh": 1.14207, "restoA": 1.06835, "restoB": 1.03916, "restoAB": 1.06835, "fi": [1.0, 1.02814, 1.05771, 1.09023, 1.11959, 1.15034], "ewCoef": 5.44e-05}, "feral_dps": {"base": 1872.7, "bshout": 1.05715, "sanc": 1.01975, "lotp": 1.0, "enh": 1.13445, "restoA": 1.06471, "restoB": 1.02944, "restoAB": 1.06471, "fi": [1.0, 1.02963, 1.05926, 1.08889, 1.11852, 1.14815], "ewCoef": 3.5622e-05}, "ret_paladin": {"base": 1302.7, "bshout": 1.07332, "sanc": 1.0, "lotp": 1.04001, "enh": 1.33521, "restoA": 1.06657, "restoB": 1.21993, "restoAB": 1.25147, "fi": [1.0, 1.02989, 1.05978, 1.08967, 1.11956, 1.14945], "ewCoef": 4.8996e-05}};
 
@@ -306,39 +306,81 @@ function allocateRaid(pool, numGroups, objective, factors) {  const MAX_STATES =
   return unique.length ? unique : null;
 }
 
-// ---------- WASM sim engine loader (inlined - artifact preview needs a single self-contained file) ----------
+// ---------- WASM sim engine loader - runs inside a Web Worker so the main thread (and the UI)
+// never blocks while a sim is running. The worker is constructed from an inline source string via
+// a Blob URL rather than a separate file, so this stays a single self-contained artifact. ----------
 
-let loadPromise = null;
-
-function loadEngine() {
-  if (loadPromise) return loadPromise;
-  loadPromise = new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = "./wasm/wasm_exec.js";
-    script.onload = async () => {
-      try {
-        // eslint-disable-next-line no-undef
-        const go = new Go();
-        window.__wasmReadyResolve = () => resolve(go);
-        window.wasmready = () => window.__wasmReadyResolve();
-        const resp = await fetch("./wasm/tbc.wasm");
-        const buffer = await resp.arrayBuffer();
-        const result = await WebAssembly.instantiate(buffer, go.importObject);
-        go.run(result.instance);
-      } catch (e) {
-        reject(e);
-      }
-    };
-    script.onerror = () => reject(new Error("failed to load wasm_exec.js"));
-    document.body.appendChild(script);
-  });
-  return loadPromise;
-}
-
-let wasmDead = false; // set true if the Go runtime ever panics - it can't be recovered without reinstantiating
-
-const MAX_SAFE_ITERATIONS = 5000; // beyond this, a single sim can hang the tab for an unreasonable time
+const MAX_SAFE_ITERATIONS = 5000; // beyond this, a single sim can take an unreasonable time
 const MIN_SAFE_ITERATIONS = 50;
+
+const WORKER_SOURCE = `
+  let enginePromise = null;
+  function loadEngine(wasmExecUrl, wasmBinaryUrl) {
+    if (enginePromise) return enginePromise;
+    enginePromise = new Promise((resolve, reject) => {
+      self.wasmready = () => resolve();
+      importScripts(wasmExecUrl);
+      const go = new Go();
+      fetch(wasmBinaryUrl)
+        .then((r) => r.arrayBuffer())
+        .then((buf) => WebAssembly.instantiate(buf, go.importObject))
+        .then((result) => { go.run(result.instance); })
+        .catch(reject);
+    });
+    return enginePromise;
+  }
+
+  let wasmDead = false;
+
+  self.onmessage = async (e) => {
+    const { id, request, wasmExecUrl, wasmBinaryUrl } = e.data;
+    try {
+      if (wasmDead) { enginePromise = null; wasmDead = false; }
+      await loadEngine(wasmExecUrl, wasmBinaryUrl);
+      const resultStr = raidSimJson(JSON.stringify(request));
+      if (resultStr === undefined || resultStr === null) {
+        self.postMessage({ id, error: "the sim engine rejected this request (invalid data) - check the uploaded JSON is a valid TBC player export" });
+        return;
+      }
+      self.postMessage({ id, result: resultStr });
+    } catch (err) {
+      const msg = String((err && err.message) || err);
+      if (msg.includes("Go program has already exited")) {
+        wasmDead = true;
+        self.postMessage({ id, error: "the sim engine crashed processing this data and has been reset - please try again, and double check any custom JSON you uploaded" });
+      } else {
+        self.postMessage({ id, error: msg });
+      }
+    }
+  };
+`;
+
+let simWorker = null;
+let nextRequestId = 1;
+const pendingRequests = new Map(); // id -> { resolve, reject }
+
+function getWorker() {
+  if (simWorker) return simWorker;
+  const blob = new Blob([WORKER_SOURCE], { type: "application/javascript" });
+  simWorker = new Worker(URL.createObjectURL(blob));
+  simWorker.onmessage = (e) => {
+    const { id, result, error } = e.data;
+    const pending = pendingRequests.get(id);
+    if (!pending) return;
+    pendingRequests.delete(id);
+    if (error) pending.reject(new Error(error));
+    else pending.resolve(result);
+  };
+  simWorker.onerror = (e) => {
+    // A worker-level error (e.g. failed to load the wasm files at all) - reject everything
+    // still waiting rather than leaving them hanging forever.
+    for (const [id, pending] of pendingRequests) {
+      pending.reject(new Error("sim worker error: " + (e.message || "unknown")));
+      pendingRequests.delete(id);
+    }
+  };
+  return simWorker;
+}
 
 async function runSim(raidSimRequest) {
   // Defense in depth: clamp iterations no matter where the request came from (our own code,
@@ -346,35 +388,22 @@ async function runSim(raidSimRequest) {
   if (raidSimRequest?.simOptions?.iterations != null) {
     raidSimRequest.simOptions.iterations = Math.max(MIN_SAFE_ITERATIONS, Math.min(MAX_SAFE_ITERATIONS, raidSimRequest.simOptions.iterations));
   }
-
-  if (wasmDead) {
-    // A previous call panicked and permanently killed the Go runtime - reinstantiate from scratch
-    // rather than leaving the user stuck until they manually reload the page.
-    loadPromise = null;
-    wasmDead = false;
-  }
-  await loadEngine();
-  try {
-    // eslint-disable-next-line no-undef
-    const resultStr = raidSimJson(JSON.stringify(raidSimRequest));
-    if (resultStr === undefined || resultStr === null) {
-      // The engine rejected the request cleanly (e.g. bad enum value) and logged to console,
-      // but didn't crash - raidSimJson returns nothing in that case.
-      throw new Error("the sim engine rejected this request (invalid data) - check the uploaded JSON is a valid TBC player export");
-    }
-    const parsed = JSON.parse(resultStr);
-    if (parsed.error) throw new Error(parsed.error.message || "sim error");
-    return parsed;
-  } catch (e) {
-    if (String(e.message).includes("Go program has already exited")) {
-      // The Go runtime panicked (a bug in the sim engine itself, or data our validation didn't
-      // catch) - mark it dead so the next call reinstantiates instead of failing forever.
-      wasmDead = true;
-      throw new Error("the sim engine crashed processing this data and has been reset - please try again, and double check any custom JSON you uploaded");
-    }
-    throw e;
-  }
+  const worker = getWorker();
+  const id = nextRequestId++;
+  const resultStr = await new Promise((resolve, reject) => {
+    pendingRequests.set(id, { resolve, reject });
+    worker.postMessage({
+      id,
+      request: raidSimRequest,
+      wasmExecUrl: new URL("./wasm/wasm_exec.js", window.location.href).href,
+      wasmBinaryUrl: new URL("./wasm/tbc.wasm", window.location.href).href,
+    });
+  });
+  const parsed = JSON.parse(resultStr);
+  if (parsed.error) throw new Error(parsed.error.message || "sim error");
+  return parsed;
 }
+
 
 // ---------- profile parsing + resim orchestration ----------
 
@@ -867,43 +896,29 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
     await resimSpec(specId, player);
   }, [presetPlayers, resimSpec, presetsUnavailable]);
 
-  // Every custom profile gets its personal DPS simmed - that's the whole point of uploading one
-  // instead of just using a preset as a buff bot. parseBuffContributor already picked the best
-  // default spec (using a hint if one was found, else the class's first option) - we just use it.
-  const addBuffContributor = useCallback(async (contributor) => {
+  // Every custom profile gets its personal DPS simmed eventually - that's the whole point of
+  // uploading one instead of just using a preset as a buff bot. parseBuffContributor already
+  // picked the best default spec (using a hint if one was found, else the class's first option).
+  // No resim happens here though - everything is deferred to the explicit "apply & resim all"
+  // click, so uploading a file never blocks the UI on its own.
+  const addBuffContributor = useCallback((contributor) => {
     const id = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const chosenSpec = contributor.simProfileChoice;
     setBuffContributors((prev) => [...prev, { ...contributor, id }]);
-    if (chosenSpec) {
-      if (presetsUnavailable) throw new Error("Resimming isn't available in this preview - it needs preset data served from the deployed website (see README).");
-      const player = parseUploadedProfile(contributor.rawJson, presetPlayers[chosenSpec], contributor.blessings);
-      await resimSpec(id, player);
-    }
     return id;
-  }, [presetPlayers, resimSpec, presetsUnavailable]);
+  }, []);
 
   // Lets the user switch a contributor's sim profile (e.g. Druid Tank <-> DPS) after the fact.
-  const setContributorSimProfile = useCallback(async (contributorId, specChoice) => {
+  // Deferred to the next "apply & resim all" - see addBuffContributor above.
+  const setContributorSimProfile = useCallback((contributorId, specChoice) => {
     setBuffContributors((prev) => prev.map((c) => (c.id === contributorId ? { ...c, simProfileChoice: specChoice } : c)));
-    if (!specChoice) return;
-    const contributor = buffContributors.find((c) => c.id === contributorId);
-    if (!contributor) return;
-    if (presetsUnavailable) throw new Error("Resimming isn't available in this preview - it needs preset data served from the deployed website (see README).");
-    const player = parseUploadedProfile(contributor.rawJson, presetPlayers[specChoice], contributor.blessings);
-    await resimSpec(contributorId, player);
-  }, [buffContributors, presetPlayers, resimSpec, presetsUnavailable]);
+  }, []);
 
   // Lets the user fine-tune which blessings this specific contributor receives - unlike every
   // other raid buff, blessings genuinely vary per person, so they're not part of the shared raid
-  // buffs settings. Re-resims immediately since it affects this contributor's own personal DPS.
-  const setContributorBlessings = useCallback(async (contributorId, newBlessings) => {
+  // buffs settings. Deferred to the next "apply & resim all" - see addBuffContributor above.
+  const setContributorBlessings = useCallback((contributorId, newBlessings) => {
     setBuffContributors((prev) => prev.map((c) => (c.id === contributorId ? { ...c, blessings: newBlessings } : c)));
-    const contributor = buffContributors.find((c) => c.id === contributorId);
-    if (!contributor || !contributor.simProfileChoice) return;
-    if (presetsUnavailable) throw new Error("Resimming isn't available in this preview - it needs preset data served from the deployed website (see README).");
-    const player = parseUploadedProfile(contributor.rawJson, presetPlayers[contributor.simProfileChoice], newBlessings);
-    await resimSpec(contributorId, player);
-  }, [buffContributors, presetPlayers, resimSpec, presetsUnavailable]);
+  }, []);
 
   const revertToPreset = useCallback((specId) => {
     setCustomPlayers((prev) => { const next = { ...prev }; delete next[specId]; return next; });
@@ -983,6 +998,7 @@ function AppShell() {
   ];
   return (
     <div>
+      <style>{"@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }"}</style>
       <div style={{ display: "flex", gap: "8px", marginBottom: "12px", flexWrap: "wrap" }}>
         {tabs.map((t) => (
           <button
@@ -1586,8 +1602,8 @@ function SettingsPanel() {
         try { json = JSON.parse(text); } catch { throw new Error("not valid JSON"); }
         const baseName = file.name.replace(/\.json$/i, "");
         const contributor = parseBuffContributor(json, baseName);
-        setSettingsDirty(true); // nudge toward "apply & resim all" immediately, before the (slow) resim even starts
-        await addBuffContributor(contributor);
+        setSettingsDirty(true); // nothing is resimmed yet - this just flags that "apply & resim all" has work to do
+        addBuffContributor(contributor);
       } catch (e) {
         setContributorError(`${file.name}: ${e.message}`);
       }
@@ -1709,7 +1725,9 @@ function SettingsPanel() {
       )}
 
       {simProgress && (
-        <div style={{ background: "#2a2410", border: "1px solid #c9962c", borderRadius: "6px", padding: "10px 16px", marginBottom: "20px", fontSize: "13px", color: "#f0c14b" }}>          Resimming {simProgress.specId}: {simProgress.current}/{simProgress.total} sims done...
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", background: "#2a2410", border: "1px solid #c9962c", borderRadius: "6px", padding: "10px 16px", marginBottom: "20px", fontSize: "13px", color: "#f0c14b" }}>
+          <Loader2 size={16} style={{ animation: "spin 1s linear infinite", flexShrink: 0 }} />
+          <span>Resimming {simProgress.specId}: {simProgress.current}/{simProgress.total} sims done...</span>
         </div>
       )}
 
@@ -1898,7 +1916,7 @@ function SettingsPanel() {
                         <span style={{ fontSize: "11px", color: "#999" }}>Sim as:</span>
                         <select
                           value={c.simProfileChoice || ""}
-                          onChange={(e) => setContributorSimProfile(c.id, e.target.value)}
+                          onChange={(e) => { setContributorSimProfile(c.id, e.target.value); setSettingsDirty(true); }}
                           disabled={simProgress?.specId === c.id}
                           style={{ background: "#1a1a1a", color: "#e8e8e8", border: "1px solid #444", borderRadius: "4px", padding: "3px 6px", fontSize: "11px" }}
                         >
@@ -1950,12 +1968,12 @@ function SettingsPanel() {
                             <input
                               type="checkbox"
                               checked={!!c.blessings?.[b.key]}
-                              onChange={(e) => setContributorBlessings(c.id, { ...c.blessings, [b.key]: e.target.checked })}
+                              onChange={(e) => { setContributorBlessings(c.id, { ...c.blessings, [b.key]: e.target.checked }); setSettingsDirty(true); }}
                             />
                           ) : (
                             <select
                               value={c.blessings?.[b.key] || "TristateEffectMissing"}
-                              onChange={(e) => setContributorBlessings(c.id, { ...c.blessings, [b.key]: e.target.value })}
+                              onChange={(e) => { setContributorBlessings(c.id, { ...c.blessings, [b.key]: e.target.value }); setSettingsDirty(true); }}
                               style={{ background: "#1a1a1a", color: "#e8e8e8", border: "1px solid #444", borderRadius: "4px", padding: "2px 4px", fontSize: "10px" }}
                             >
                               <option value="TristateEffectMissing">off</option>
@@ -2023,7 +2041,7 @@ function SettingsPanel() {
         </div>
       </div>
 
-      <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
         <button
           id="apply-resim-all-button"
           onClick={applySettingsAndResimAll}
@@ -2036,6 +2054,12 @@ function SettingsPanel() {
         >
           {resimmingAll ? "resimming everything..." : `apply & resim all profiles (~${Math.round(perProfileEstimate * (SPEC_LIST.length - excludedPresets.size + buffContributors.filter((c) => c.simProfileChoice).length) / 60)} min total)`}
         </button>
+        {simProgress && (
+          <div style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", color: "#f0c14b" }}>
+            <Loader2 size={16} style={{ animation: "spin 1s linear infinite", flexShrink: 0 }} />
+            <span>Resimming {simProgress.specId}: {simProgress.current}/{simProgress.total} sims done...</span>
+          </div>
+        )}
         {!settingsAreDefault && (
           <button onClick={revertSettings} style={{ background: "none", color: "#999", border: "1px solid #444", borderRadius: "6px", padding: "10px 16px", fontSize: "13px", cursor: "pointer" }}>
             reset to default settings
