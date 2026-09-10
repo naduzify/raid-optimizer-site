@@ -3,6 +3,20 @@
 A small React app that splits a pool of available players across up to 3
 raid groups to maximize DPS, based on TBC Anniversary sim data.
 
+## Features
+
+- **Optimize from pool** - enter what you have available, get the best split
+- **Build & compare manually** - freely assign specs to slots and compare
+- **Profiles & settings** - upload custom gear/talents per spec and resim
+  live in your browser (real TBC sim engine compiled to WASM), or customize
+  the shared encounter/debuff settings everyone is simmed against
+
+Custom resimming runs the actual sim engine client-side - no server needed,
+but it does real computation in your browser and can take anywhere from
+~30 seconds (Very low precision, one profile) to several minutes (Medium
+precision, resimming everything after an encounter/debuff change). Progress
+is shown live.
+
 ## Run locally
 
 ```
