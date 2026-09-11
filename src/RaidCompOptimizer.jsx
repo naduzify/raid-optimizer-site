@@ -1575,13 +1575,18 @@ function ManualBuilder() {
                         onChange={(e) => setSlot(gIdx, sIdx, e.target.value)}
                         style={{ width: "100%", background: "#1a1a1a", color: "#e8e8e8", border: "1px solid #444", borderRadius: "4px", padding: "5px 6px", fontSize: "12px", marginBottom: "8px" }}
                       >
-                        {SLOT_OPTIONS.map((o) => {
-                          const specMatch = SPEC_LIST.find((s) => s.id === o.value);
-                          const label = specMatch ? specDisplayLabel(o.value, o.label, profileMeta) : o.label;
-                          return <option key={o.value} value={o.value}>{label}</option>;
-                        })}
+                        {SLOT_OPTIONS.filter((o) => o.value === "empty").map((o) => (
+                          <option key={o.value} value={o.value}>{o.label}</option>
+                        ))}
+                        <optgroup label="Preset">
+                          {SLOT_OPTIONS.filter((o) => o.value !== "empty").map((o) => {
+                            const specMatch = SPEC_LIST.find((s) => s.id === o.value);
+                            const label = specMatch ? specDisplayLabel(o.value, o.label, profileMeta) : o.label;
+                            return <option key={o.value} value={o.value}>{label}</option>;
+                          })}
+                        </optgroup>
                         {buffContributors.length > 0 && (
-                          <optgroup label="Buff contributors">
+                          <optgroup label="Custom profiles">
                             {buffContributors.map((c) => (
                               <option key={c.id} value={`contrib:${c.id}`}>{c.name} ({c.class.replace("Class", "")})</option>
                             ))}
