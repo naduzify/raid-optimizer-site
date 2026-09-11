@@ -330,7 +330,15 @@ function allocateRaid(pool, numGroups, objective, factors, excludedPresets, acti
   // check presence; we have to figure out which totem (if any) the hunter's own group ends up with,
   // and that choice can itself affect which totem is best for that group overall.
   function correctForSurvivalHunterAgility(groupResults, objective, namedPerGroup, perGroupExtraBuffs) {
-    const svGroupIdxs = groupResults.map((r, i) => (r.lockedCounts.survival_hunter > 0 ? i : -1)).filter((i) => i >= 0);
+    // A survival hunter can be a preset (lockedCounts.survival_hunter) OR a custom profile resolved
+    // to that spec (namedPerGroup) - missing the latter means EW silently never triggers for any
+    // group whose survival hunter is a custom profile rather than the preset.
+    const groupHasSvHunter = (i) => {
+      if (groupResults[i].lockedCounts.survival_hunter > 0) return true;
+      const contributorById = new Map(contributors.map((c) => [c.id, c]));
+      return (namedPerGroup[i] || []).some((entry) => contributorById.get(entry.id)?.simProfileChoice === "survival_hunter");
+    };
+    const svGroupIdxs = groupResults.map((r, i) => (groupHasSvHunter(i) ? i : -1)).filter((i) => i >= 0);
     if (svGroupIdxs.length === 0) return groupResults;
 
     const optionsPerGroup = svGroupIdxs.map((i) => {
@@ -657,6 +665,24 @@ function parseUploadedProfile(rawJson, presetPlayer, blessingsOverride) {
 
   const baseBuffs = typeof uploaded.buffs === "object" && uploaded.buffs ? uploaded.buffs : presetPlayer.buffs;
 
+  // Use the uploaded profile's own rotation only when it's an explicit TypeAPL priority list - the
+  // legacy TypeSimple format doesn't run at all in this engine (confirmed: flat 0 DPS), and
+  // TypeAuto - what website exports for feral/rogue/enhance actually use - was empirically tested
+  // and produces dramatically worse DPS than our presets' handcrafted APLs (733 vs ~1958 for a
+  // feral cat in one direct test), so it is NOT treated as usable here despite technically running
+  // without erroring - "runs without crashing" and "gives a meaningful rotation" turned out to be
+  // different things for that type. The spec-options block (dpsWarrior/hunter/feralCatDruid/etc)
+  // travels with whichever rotation wins, since APL conditions reference variables defined there.
+  const uploadedRotationType = uploaded.rotation?.type;
+  const rotationIsUsable = uploadedRotationType === "TypeAPL";
+  const SPEC_OPTIONS_KEYS = ["dpsWarrior", "hunter", "feralCatDruid", "feralBearDruid", "enhancementShaman", "rogue", "retributionPaladin"];
+  const specOptionsFromUpload = {};
+  if (rotationIsUsable) {
+    for (const key of SPEC_OPTIONS_KEYS) {
+      if (uploaded[key] !== undefined) specOptionsFromUpload[key] = uploaded[key];
+    }
+  }
+
   return {
     ...presetPlayer,
     name: typeof uploaded.name === "string" ? uploaded.name.slice(0, 60) : presetPlayer.name,
@@ -671,7 +697,7 @@ function parseUploadedProfile(rawJson, presetPlayer, blessingsOverride) {
     // whatever the raw upload said.
     buffs: blessingsOverride ? { ...baseBuffs, ...blessingsOverride } : baseBuffs,
     bonusStats: typeof uploaded.bonusStats === "object" && uploaded.bonusStats ? uploaded.bonusStats : presetPlayer.bonusStats,
-    // rotation and spec-options block intentionally NOT overridden - see comment above
+    ...(rotationIsUsable ? { rotation: uploaded.rotation, ...specOptionsFromUpload } : {}),
   };
 }
 
@@ -1929,10 +1955,13 @@ function OptimizerMode() {
 
   const suggestions = useMemo(() => {
     if (!top) return null;
-    const svGroup = top.groupResults.find((r) => r.lockedCounts.survival_hunter > 0);
+    const svGroup = top.groupResults.find((r) =>
+      r.lockedCounts.survival_hunter > 0 ||
+      (r.namedEntries || []).some((entry) => buffContributors.find((c) => c.id === entry.id)?.simProfileChoice === "survival_hunter")
+    );
     const raidWideEW = svGroup ? { agility: EW_BASE_AGILITY + survivalHunterAgilityBump(svGroup.state.shaman), uptime: EW_UPTIME_DEFAULT } : null;
     return top.groupResults.map((r) => bestFill(r.lockedCounts, r.lockedResto, r.remaining, excludeHunters, raidWideEW, factors, excludedPresets, r.namedEntries, r.extraBuffs));
-  }, [top, excludeHunters, factors, excludedPresets]);
+  }, [top, excludeHunters, factors, excludedPresets, buffContributors]);
 
   return (
     <div style={{ background: "#121212", color: "#e8e8e8", padding: "24px", borderRadius: "8px", fontFamily: "system-ui, sans-serif", maxWidth: "100%" }}>
@@ -2572,6 +2601,14 @@ function SettingsPanel() {
         buffs it grants to the rest of the group are read automatically from its class and talents. Use the
         Preset specs elsewhere in this tool if you just want a generic buff bot.
       </p>
+      <div style={{ display: "flex", gap: "8px", alignItems: "flex-start", background: "#2a2410", border: "1px solid #c9962c", borderRadius: "6px", padding: "8px 12px", marginBottom: "10px", color: "#f0c14b", fontSize: "11px" }}>
+        <AlertTriangle size={13} style={{ marginTop: "1px", flexShrink: 0 }} />
+        <span>
+          Custom APL rotations from your upload aren't well integrated yet - a profile using "simple" or "auto"
+          rotation will fall back to this spec's default preset rotation rather than your file's own settings,
+          and even an explicit APL rotation from your file is a newer, less-tested path.
+        </span>
+      </div>
       <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px", color: "#c9962c", cursor: "pointer", border: "1px solid #444", borderRadius: "4px", padding: "6px 12px", marginBottom: "12px" }}>
         <Upload size={13} />
         upload player JSON(s)
