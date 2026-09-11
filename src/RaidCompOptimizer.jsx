@@ -1,5 +1,5 @@
-import { useState, useMemo, useEffect, createContext, useContext, useCallback } from "react";
-import { Swords, Trophy, AlertTriangle, Upload, Settings, Loader2 } from "lucide-react";
+import { useState, useMemo, useEffect, useRef, createContext, useContext, useCallback } from "react";
+import { Swords, Trophy, AlertTriangle, Upload, Settings, Loader2, X } from "lucide-react";
 
 const PRESET_FACTORS = {"fury_warrior": {"base": 1485.8, "bshout": 1.00123, "sanc": 1.02179, "lotp": 1.05954, "enh": 1.27491, "restoA": 1.07431, "restoB": 1.14263, "restoAB": 1.17697, "fi": [1.0, 1.03299, 1.06448, 1.09751, 1.1353, 1.16826], "ewCoef": 5.9113e-05}, "kebab_warrior": {"base": 1199.5, "bshout": 1.00352, "sanc": 1.02389, "lotp": 1.05704, "enh": 1.26015, "restoA": 1.0693, "restoB": 1.14561, "restoAB": 1.17506, "fi": [1.0, 1.03471, 1.06892, 1.10124, 1.13331, 1.16672], "ewCoef": 5.728e-05}, "arms2h_warrior": {"base": 1371.2, "bshout": 1.00724, "sanc": 1.02072, "lotp": 1.04864, "enh": 1.27558, "restoA": 1.0644, "restoB": 1.16101, "restoAB": 1.18973, "fi": [1.0, 1.03181, 1.07029, 1.10426, 1.14069, 1.1739], "ewCoef": 5.443e-05}, "bm_hunter": {"base": 2413.6, "bshout": 1.04643, "sanc": 1.01975, "lotp": 1.0502, "enh": 1.10147, "restoA": 1.0549, "restoB": 1.03132, "restoAB": 1.06796, "fi": [1.0, 1.02963, 1.05925, 1.08888, 1.11851, 1.14813], "ewCoef": 6.3715e-05}, "survival_hunter": {"base": 2189.0, "bshout": 1.03262, "sanc": 1.01976, "lotp": 1.04876, "enh": 1.09993, "restoA": 1.04869, "restoB": 1.03222, "restoAB": 1.0702, "fi": [1.0, 1.02964, 1.05928, 1.08892, 1.11856, 1.1482], "ewCoef": 0.0}, "rogue": {"base": 1459.6, "bshout": 1.07879, "sanc": 1.01967, "lotp": 1.03906, "enh": 1.21558, "restoA": 1.05283, "restoB": 1.10672, "restoAB": 1.14311, "fi": [1.0, 1.0295, 1.059, 1.08851, 1.11801, 1.14751], "ewCoef": 5.4976e-05}, "enhance_shaman": {"base": 1906.3, "bshout": 1.07261, "sanc": 1.01756, "lotp": 1.03495, "enh": 1.00674, "restoA": 1.00524, "restoB": 0.99986, "restoAB": 1.00514, "fi": [1.0, 1.02634, 1.05269, 1.07903, 1.10538, 1.13172], "ewCoef": 4.8003e-05}, "feral_tank": {"base": 791.6, "bshout": 1.07989, "sanc": 1.02012, "lotp": 1.0, "enh": 1.14207, "restoA": 1.06835, "restoB": 1.03916, "restoAB": 1.06835, "fi": [1.0, 1.02814, 1.05771, 1.09023, 1.11959, 1.15034], "ewCoef": 5.44e-05}, "feral_dps": {"base": 1872.7, "bshout": 1.05715, "sanc": 1.01975, "lotp": 1.0, "enh": 1.13445, "restoA": 1.06471, "restoB": 1.02944, "restoAB": 1.06471, "fi": [1.0, 1.02963, 1.05926, 1.08889, 1.11852, 1.14815], "ewCoef": 3.5622e-05}, "ret_paladin": {"base": 1302.7, "bshout": 1.07332, "sanc": 1.0, "lotp": 1.04001, "enh": 1.33521, "restoA": 1.06657, "restoB": 1.21993, "restoAB": 1.25147, "fi": [1.0, 1.02989, 1.05978, 1.08967, 1.11956, 1.14945], "ewCoef": 4.8996e-05}};
 
@@ -813,6 +813,43 @@ function parseBuffContributor(rawJson, filenameFallback) {
 
 const DEFAULT_RAID_BUFFS = { arcaneBrilliance: true, powerWordFortitude: "TristateEffectImproved", shadowProtection: true, divineSpirit: "TristateEffectImproved", giftOfTheWild: "TristateEffectImproved", bloodlust: true };
 
+// ---------- saved loadouts (localStorage) ----------
+// A loadout snapshots everything needed to reproduce a full setup instantly, without re-resimming:
+// encounter/debuffs/raid buffs, which presets are excluded, every custom profile (including its raw
+// upload so it could be re-parsed later if needed), and the actual resimmed factors table - loading
+// a loadout is instant specifically because the factors are saved too, not recomputed.
+const LOADOUTS_STORAGE_KEY = "raid-optimizer-loadouts-v1";
+const MAX_STORED_LOADOUTS = 50; // oldest auto-saves get pruned past this to keep localStorage bounded
+
+function loadLoadoutsFromStorage() {
+  try {
+    const raw = localStorage.getItem(LOADOUTS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return []; // localStorage unavailable (private browsing, disabled, quota issues) - degrade quietly
+  }
+}
+
+function persistLoadoutsToStorage(loadouts) {
+  try {
+    // keep the most recent N by creation time if we're over the cap
+    const sorted = [...loadouts].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    const capped = sorted.slice(0, MAX_STORED_LOADOUTS);
+    localStorage.setItem(LOADOUTS_STORAGE_KEY, JSON.stringify(capped));
+    return capped;
+  } catch {
+    return loadouts; // couldn't persist (quota exceeded, disabled, etc) - keep going in-memory only
+  }
+}
+
+function formatLoadoutTimestamp(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+
 function buildSimRequest(player, debuffs, encounter, partyBuffs, raidBuffs, iterations, seed = 12345) {
   return {
     raid: {
@@ -943,6 +980,72 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
   const [customPlayers, setCustomPlayers] = useState({}); // specId -> parsed player object
   const [buffContributors, setBuffContributors] = useState([]); // [{id, name, class, capabilities, totemChoice}]
   const [excludedPresets, setExcludedPresets] = useState(new Set()); // preset spec ids to skip during "apply & resim all"
+  const [loadouts, setLoadouts] = useState(() => loadLoadoutsFromStorage());
+  const [activeLoadoutId, setActiveLoadoutId] = useState(null); // null = "Default" / an unsaved current state
+
+  // saveLoadout needs the LATEST values at the moment it's actually called, not whatever was
+  // captured in its closure when it was created - autoSaveLoadout is called right after resimAll,
+  // which updates factors incrementally across many state updates during its run, so a normal
+  // closure here would save stale (pre-resim) factors. Refs sidestep that entirely.
+  const latestRef = useRef({});
+  latestRef.current = { debuffs, encounter, raidBuffs, excludedPresets, buffContributors, factors };
+
+  const saveLoadout = useCallback((name) => {
+    const cur = latestRef.current;
+    const loadout = {
+      id: `loadout_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      name,
+      createdAt: new Date().toISOString(),
+      debuffs: cur.debuffs, encounter: cur.encounter, raidBuffs: cur.raidBuffs,
+      excludedPresets: [...cur.excludedPresets],
+      buffContributors: cur.buffContributors,
+      factors: cur.factors,
+    };
+    setLoadouts((prev) => persistLoadoutsToStorage([...prev, loadout]));
+    setActiveLoadoutId(loadout.id);
+    return loadout.id;
+  }, []);
+
+  // Called automatically right after a successful "apply & resim all" - the whole point is the
+  // user never has to remember to save; every resim leaves behind a named snapshot they can return
+  // to instantly, and they can rename it whenever they want via the same editable-name pattern
+  // used for custom profiles elsewhere in the app.
+  const autoSaveLoadout = useCallback(() => {
+    return saveLoadout(formatLoadoutTimestamp(new Date()));
+  }, [saveLoadout]);
+
+  const renameLoadout = useCallback((id, newName) => {
+    setLoadouts((prev) => persistLoadoutsToStorage(prev.map((l) => (l.id === id ? { ...l, name: newName.slice(0, 80) } : l))));
+  }, []);
+
+  const deleteLoadout = useCallback((id) => {
+    setLoadouts((prev) => persistLoadoutsToStorage(prev.filter((l) => l.id !== id)));
+    setActiveLoadoutId((prev) => (prev === id ? null : prev));
+  }, []);
+
+  const applyLoadoutById = useCallback((id) => {
+    const loadout = loadouts.find((l) => l.id === id);
+    if (!loadout) return;
+    setDebuffs(loadout.debuffs);
+    setEncounter(loadout.encounter);
+    setRaidBuffs(loadout.raidBuffs);
+    setExcludedPresets(new Set(loadout.excludedPresets));
+    setBuffContributors(loadout.buffContributors);
+    setFactorsState(loadout.factors);
+    setSettingsAreDefault(false);
+    setActiveLoadoutId(id);
+  }, [loadouts]);
+
+  const applyDefaultLoadout = useCallback(() => {
+    setDebuffs(DEFAULT_DEBUFFS);
+    setEncounter(DEFAULT_ENCOUNTER);
+    setRaidBuffs(DEFAULT_RAID_BUFFS);
+    setExcludedPresets(new Set());
+    setBuffContributors([]);
+    setFactorsState(presetFactors);
+    setSettingsAreDefault(true);
+    setActiveLoadoutId(null);
+  }, [presetFactors]);
 
   const togglePresetExcluded = useCallback((specId) => {
     setExcludedPresets((prev) => {
@@ -1058,6 +1161,7 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
     simProgress, resimSpec, uploadCustomProfile, revertToPreset, updateSettings, resetSettingsToDefault, resimAll,
     presetFactors, presetsUnavailable,
     buffContributors, addBuffContributor, removeBuffContributor, setContributorTotemChoice, renameContributor, setContributorSimProfile, setContributorBlessings, excludedPresets, togglePresetExcluded,
+    loadouts, activeLoadoutId, saveLoadout, autoSaveLoadout, renameLoadout, deleteLoadout, applyLoadoutById, applyDefaultLoadout,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
@@ -1220,6 +1324,67 @@ function evalSlots(slots, ewOverride, factors, buffContributors, excludedPresets
   return evaluateGroup(counts, restoAgi, restoWf, ewOverride, factors, extraBuffs, namedDpsEntries, excludedPresets);
 }
 
+// Shared across all three tabs - lets the user instantly switch between a fully saved setup
+// (encounter/debuffs/raid buffs/custom profiles/factors, all restored without re-resimming) or
+// back to the app's built-in defaults. New loadouts appear automatically after every successful
+// "apply & resim all" - the name shown here is always editable, no separate rename mode needed.
+function LoadProfileSelector() {
+  const { loadouts, activeLoadoutId, applyLoadoutById, applyDefaultLoadout, renameLoadout, deleteLoadout } = useAppContext();
+  const sorted = useMemo(() => [...loadouts].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)), [loadouts]);
+
+  const tagBase = {
+    display: "flex", alignItems: "center", gap: "6px", borderRadius: "14px", fontSize: "12px",
+  };
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", marginBottom: "14px" }}>
+      <span style={{ fontSize: "12px", color: "#999" }}>Loadout:</span>
+      <button
+        onClick={applyDefaultLoadout}
+        style={{
+          ...tagBase, padding: "5px 12px", cursor: "pointer",
+          background: !activeLoadoutId ? "#2a2410" : "#1a1a1a",
+          border: "1px solid " + (!activeLoadoutId ? "#c9962c" : "#444"),
+          color: !activeLoadoutId ? "#f0c14b" : "#ccc",
+        }}
+      >
+        Default
+      </button>
+      {sorted.map((l) => {
+        const isActive = l.id === activeLoadoutId;
+        return (
+          <div
+            key={l.id}
+            style={{
+              ...tagBase, padding: isActive ? "3px 6px 3px 12px" : "5px 6px 5px 12px",
+              background: isActive ? "#12202b" : "#1a1a1a",
+              border: "1px solid " + (isActive ? "#2c6a8e" : "#444"),
+            }}
+          >
+            {isActive ? (
+              <input
+                value={l.name}
+                onChange={(e) => renameLoadout(l.id, e.target.value)}
+                autoFocus
+                style={{ background: "transparent", border: "none", outline: "none", color: "#7ec1f0", fontSize: "12px", padding: "2px 0", width: `${Math.max(70, l.name.length * 7 + 10)}px` }}
+              />
+            ) : (
+              <span onClick={() => applyLoadoutById(l.id)} style={{ cursor: "pointer", color: "#ccc" }}>{l.name}</span>
+            )}
+            <button
+              onClick={() => deleteLoadout(l.id)}
+              title="delete this loadout"
+              style={{ background: "none", border: "none", color: "#888", cursor: "pointer", padding: "2px", display: "flex", alignItems: "center" }}
+            >
+              <X size={13} />
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ManualBuilder() {
   const { factors, profileMeta, buffContributors, excludedPresets } = useAppContext();
   const [numGroups, setNumGroups] = useState(1);
@@ -1257,6 +1422,8 @@ function ManualBuilder() {
       <p style={{ color: "#999", fontSize: "13px", marginTop: "4px", marginBottom: "16px" }}>
         Pick a spec for each slot and see personal dps plus each slot's marginal contribution to the group, updated instantly.
       </p>
+
+      <LoadProfileSelector />
 
       <label style={{ fontSize: "13px", color: "#aaa", display: "flex", alignItems: "center", gap: "6px", marginBottom: "16px", width: "fit-content" }}>
         Number of groups:
@@ -1466,6 +1633,8 @@ function OptimizerMode() {
         its own against a baseline, then combined mathematically. This has been checked against directly-simmed
         combinations and stays within about 0.3% of the real result.
       </div>
+
+      <LoadProfileSelector />
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))", gap: "10px", marginBottom: "16px" }}>
         {SPEC_LIST.filter((spec) => !excludedPresets.has(spec.id)).map((spec) => (
@@ -1719,7 +1888,7 @@ function SettingsPanel() {
   const {
     debuffs, encounter, raidBuffs, settingsAreDefault, precision, setPrecision,
     simProgress, updateSettings, resetSettingsToDefault, resimAll,
-    presetsUnavailable, factors, buffContributors, addBuffContributor, removeBuffContributor, setContributorTotemChoice, renameContributor, setContributorSimProfile, setContributorBlessings, excludedPresets, togglePresetExcluded,
+    presetsUnavailable, factors, buffContributors, addBuffContributor, removeBuffContributor, setContributorTotemChoice, renameContributor, setContributorSimProfile, setContributorBlessings, excludedPresets, togglePresetExcluded, autoSaveLoadout,
   } = useAppContext();
 
   const [draftDebuffs, setDraftDebuffs] = useState(debuffs);
@@ -1728,7 +1897,8 @@ function SettingsPanel() {
   const [draftLevel, setDraftLevel] = useState(encounter.targets[0].level);
   const [draftArmor, setDraftArmor] = useState(encounter.targets[0].stats[31] || 7685);
   const [draftMobType, setDraftMobType] = useState(encounter.targets[0].mobType);
-  const [draftEncounterOverride, setDraftEncounterOverride] = useState(null); // set by a full-encounter JSON upload (can be multi-target); bypasses the fields above
+  const [draftEncounterOverride, setDraftEncounterOverride] = useState(null); // only set for genuinely multi-target uploads - the fields above can't represent those
+  const [encounterUploadNotice, setEncounterUploadNotice] = useState(null);
   const [settingsDirty, setSettingsDirty] = useState(false);
   const [uploadError, setUploadError] = useState(null);
   const [contributorError, setContributorError] = useState(null);
@@ -1781,10 +1951,23 @@ function SettingsPanel() {
 
   const handleEncounterUpload = async (file) => {
     setUploadError(null);
+    setEncounterUploadNotice(null);
     try {
       const json = extractSubObject(await readUploadedJson(file), "encounter");
       validateEncounterUpload(json);
-      setDraftEncounterOverride(json);
+      if (json.targets.length === 1) {
+        // A single target maps cleanly onto the visible fields - update them directly instead of
+        // hiding everything behind an opaque "uploaded encounter" state, so what actually changed is visible.
+        setDraftDuration(json.duration ?? draftDuration);
+        setDraftLevel(json.targets[0].level ?? draftLevel);
+        setDraftArmor(json.targets[0].stats?.[31] ?? draftArmor);
+        setDraftMobType(json.targets[0].mobType ?? draftMobType);
+        setDraftEncounterOverride(null);
+      } else {
+        // Multiple targets can't be represented by the simple fields - fall back to the full override.
+        setDraftEncounterOverride(json);
+      }
+      setEncounterUploadNotice("Encounter fields updated from the uploaded file. If it also specifies different raid buffs or debuffs, upload it to those sections too to match it fully.");
       setSettingsDirty(true);
     } catch (e) {
       setUploadError(`encounter: ${e.message}`);
@@ -1830,6 +2013,7 @@ function SettingsPanel() {
     setResimmingAll(true);
     try {
       await resimAll(draftDebuffs, newEncounter, draftRaidBuffs); // pass explicitly - state above hasn't committed yet
+      autoSaveLoadout(); // every successful resim leaves behind a named, instantly-reloadable snapshot
     } catch (e) {
       setResimError(e.message);
     } finally {
@@ -1860,6 +2044,8 @@ function SettingsPanel() {
         Resimming runs the sim engine right here in your browser and can take a little while - see the time
         estimate below before you start.
       </p>
+
+      <LoadProfileSelector />
 
       {presetsUnavailable && (
         <div style={{ display: "flex", gap: "8px", alignItems: "flex-start", background: "#3a1f1f", border: "1px solid #6b2c2c", borderRadius: "6px", padding: "12px 16px", marginBottom: "20px", color: "#e0a0a0", fontSize: "13px" }}>
@@ -1912,6 +2098,11 @@ function SettingsPanel() {
             <input type="file" accept=".json" style={{ display: "none" }} onChange={(e) => e.target.files[0] && handleEncounterUpload(e.target.files[0])} />
           </label>
         </div>
+        {encounterUploadNotice && (
+          <div style={{ display: "flex", gap: "8px", alignItems: "center", background: "#12202b", border: "1px solid #2c6a8e", borderRadius: "6px", padding: "8px 12px", marginBottom: "10px", color: "#7ec1f0", fontSize: "11px" }}>
+            <AlertTriangle size={13} /> {encounterUploadNotice}
+          </div>
+        )}
         {draftEncounterOverride ? (
           <div style={{ fontSize: "12px", color: "#7ec1f0", display: "flex", alignItems: "center", gap: "8px" }}>
             using uploaded encounter ({draftEncounterOverride.targets.length} target{draftEncounterOverride.targets.length > 1 ? "s" : ""})
