@@ -239,6 +239,43 @@ const CATEGORY_STAGES = [
   ["ret_paladin"],
 ];
 
+// When the requested roster is bigger than the raid can hold, rather than blocking computation
+// entirely, keep the highest-DPS units up to capacity and bench the rest - ranked by each unit's
+// own base DPS (resto shamans don't have one tracked, since they're pure support, so they rank
+// lowest and get benched first if space is tight).
+// "A, B, C and D" - no oxford comma, matching how the app talks elsewhere in prose.
+function formatBenchList(names) {
+  if (names.length === 1) return names[0];
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+function trimPoolToCapacity(counts, restoCount, poolContributors, capacity, factors) {
+  const units = [];
+  for (const spec of SPEC_LIST) {
+    const n = counts[spec.id] || 0;
+    const dps = factors[spec.id]?.base || 0;
+    for (let i = 0; i < n; i++) units.push({ type: "preset", id: spec.id, label: `Preset: ${spec.label}`, dps });
+  }
+  for (let i = 0; i < restoCount; i++) units.push({ type: "resto", label: "Resto shaman", dps: 0 });
+  for (const c of poolContributors) {
+    units.push({ type: "contrib", id: c.id, label: c.name, dps: factors[c.id]?.base || 0 });
+  }
+  // stable sort by dps descending - ties keep their original relative order rather than shuffling
+  const ranked = units.map((u, i) => ({ ...u, i })).sort((a, b) => b.dps - a.dps || a.i - b.i);
+  const kept = ranked.slice(0, capacity);
+  const benched = ranked.slice(capacity);
+
+  const trimmedCounts = Object.fromEntries(SPEC_LIST.map((s) => [s.id, 0]));
+  let trimmedRestoCount = 0;
+  const trimmedContributors = [];
+  for (const u of kept) {
+    if (u.type === "preset") trimmedCounts[u.id] += 1;
+    else if (u.type === "resto") trimmedRestoCount += 1;
+    else trimmedContributors.push(poolContributors.find((c) => c.id === u.id));
+  }
+  return { trimmedCounts, trimmedRestoCount, trimmedContributors, benchList: benched.map((u) => u.label) };
+}
+
 function allocateRaid(pool, numGroups, objective, factors, excludedPresets, activeContributors) {  const MAX_STATES = 4000;
   const contributors = activeContributors || [];
   const bySignature = groupContributorsBySignature(contributors);
@@ -1523,6 +1560,23 @@ function evalSlots(slots, ewOverride, factors, buffContributors, excludedPresets
 function LoadProfileSelector() {
   const { loadouts, activeLoadoutId, applyLoadoutById, applyDefaultLoadout, renameLoadout, deleteLoadout } = useAppContext();
   const sorted = useMemo(() => [...loadouts].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)), [loadouts]);
+  const [hoveredId, setHoveredId] = useState(null);
+
+  // What this loadout would actually add to the pool if applied - both presets and custom
+  // profiles, so hovering answers "who's in this" without having to apply it first to find out.
+  const loadoutProfileList = (l) => {
+    const names = [];
+    for (const spec of SPEC_LIST) {
+      const n = l.poolCounts?.[spec.id] || 0;
+      if (n > 0) names.push(`${spec.label}${n > 1 ? ` x${n}` : ""}`);
+    }
+    if (l.poolRestoCount > 0) names.push(`Resto shaman${l.poolRestoCount > 1 ? ` x${l.poolRestoCount}` : ""}`);
+    for (const c of l.buffContributors || []) {
+      const n = l.poolContributorCounts?.[c.id] || 0;
+      if (n > 0) names.push(`${c.name}${n > 1 ? ` x${n}` : ""}`);
+    }
+    return names;
+  };
 
   const tagBase = {
     display: "flex", alignItems: "center", gap: "6px", borderRadius: "14px", fontSize: "12px",
@@ -1544,15 +1598,21 @@ function LoadProfileSelector() {
       </button>
       {sorted.map((l) => {
         const isActive = l.id === activeLoadoutId;
+        const profileList = hoveredId === l.id ? loadoutProfileList(l) : null;
         return (
           <div
             key={l.id}
-            style={{
-              ...tagBase, padding: isActive ? "3px 6px 3px 12px" : "5px 6px 5px 12px",
-              background: isActive ? "#12202b" : "#1a1a1a",
-              border: "1px solid " + (isActive ? "#2c6a8e" : "#444"),
-            }}
+            onMouseEnter={() => setHoveredId(l.id)}
+            onMouseLeave={() => setHoveredId(null)}
+            style={{ position: "relative" }}
           >
+            <div
+              style={{
+                ...tagBase, padding: isActive ? "3px 6px 3px 12px" : "5px 6px 5px 12px",
+                background: isActive ? "#12202b" : "#1a1a1a",
+                border: "1px solid " + (isActive ? "#2c6a8e" : "#444"),
+              }}
+            >
             {isActive ? (
               <input
                 value={l.name}
@@ -1570,6 +1630,17 @@ function LoadProfileSelector() {
             >
               <X size={13} />
             </button>
+            </div>
+            {profileList && (
+              <div style={{
+                position: "absolute", top: "calc(100% + 4px)", left: 0, zIndex: 10,
+                background: "#1a1a1a", border: "1px solid #444", borderRadius: "6px",
+                padding: "8px 10px", fontSize: "11px", color: "#ccc", whiteSpace: "nowrap",
+                boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
+              }}>
+                {profileList.length > 0 ? profileList.map((n, i) => <div key={i}>{n}</div>) : <div style={{ color: "#777" }}>no profiles in this pool</div>}
+              </div>
+            )}
           </div>
         );
       })}
@@ -1767,6 +1838,7 @@ function ManualBuilder() {
 function OptimizerMode() {
   const {
     factors, profileMeta, excludedPresets, buffContributors, resimmedUnderSettings, debuffs, encounter, raidBuffs,
+    loadouts, activeLoadoutId,
     poolCounts: counts, setPoolCounts: setCounts,
     poolRestoCount: restoCount, setPoolRestoCount: setRestoCount,
     poolNumGroups: numGroups, setPoolNumGroups: setNumGroups,
@@ -1789,14 +1861,24 @@ function OptimizerMode() {
   // Profiles with valid cached data for the CURRENT settings, not yet in the pool, and not dismissed -
   // rather than silently auto-including them (which could surprise someone with players they didn't
   // choose), this surfaces them as a one-click opt-in instead.
+  // Only surfaced when a genuinely different saved loadout - not just "this contributor's cache
+  // happens to still be fresh" - used this same encounter/debuffs/raid buffs scenario AND included
+  // this contributor. That's a real pattern worth surfacing (you've paired this profile with this
+  // scenario before); merely having valid cached data isn't, since that's true of anything not yet
+  // resimmed under different settings.
+  const matchingLoadouts = useMemo(() => {
+    return loadouts.filter((l) =>
+      l.id !== activeLoadoutId &&
+      deepEqual(l.debuffs, debuffs) && deepEqual(l.encounter, encounter) && deepEqual(l.raidBuffs, raidBuffs)
+    );
+  }, [loadouts, activeLoadoutId, debuffs, encounter, raidBuffs]);
   const suggestedContributors = useMemo(() => {
     return activeContributors.filter((c) => {
       if ((contributorCounts[c.id] || 0) > 0) return false;
       if (dismissedSuggestionIds.has(c.id)) return false;
-      const snap = resimmedUnderSettings[c.id];
-      return snap && deepEqual(snap.debuffs, debuffs) && deepEqual(snap.encounter, encounter) && deepEqual(snap.raidBuffs, raidBuffs);
+      return matchingLoadouts.some((l) => (l.poolContributorCounts?.[c.id] || 0) > 0);
     });
-  }, [activeContributors, contributorCounts, dismissedSuggestionIds, resimmedUnderSettings, debuffs, encounter, raidBuffs]);
+  }, [activeContributors, contributorCounts, dismissedSuggestionIds, matchingLoadouts]);
   const updateContributorCount = (id, delta) => {
     setContributorCounts((prev) => ({ ...prev, [id]: Math.max(0, (prev[id] || 0) + delta) }));
     markStale();
@@ -1813,16 +1895,16 @@ function OptimizerMode() {
   const totalLocked = useMemo(() => Object.values(counts).reduce((a, b) => a + b, 0) + restoCount, [counts, restoCount]);
   const capacity = numGroups * 5;
   const contributorCapacity = Math.min(poolContributors.length, capacity);
-  const overflow = totalLocked > capacity - contributorCapacity;
+  const overflow = totalLocked > capacity - contributorCapacity; // still shown as a heads-up, but no longer blocks computing
 
   const results = useMemo(() => {
-    if (!committed || committed.overflow) return null;
+    if (!committed) return null;
     // Excluded presets are hidden from this pool entirely - zero their counts even if some were
     // set before they became excluded, so a stale count can't silently sneak into the search.
-    const cleanCounts = { ...committed.counts };
+    const cleanCounts = { ...committed.trimmedCounts };
     for (const specId of excludedPresets) cleanCounts[specId] = 0;
-    const pool = { ...cleanCounts, resto_shaman: committed.restoCount };
-    return allocateRaid(pool, committed.numGroups, committed.objective, factors, excludedPresets, committed.poolContributors);
+    const pool = { ...cleanCounts, resto_shaman: committed.trimmedRestoCount };
+    return allocateRaid(pool, committed.numGroups, committed.objective, factors, excludedPresets, committed.trimmedContributors);
   }, [committed, factors, excludedPresets]);
 
   const markStale = () => setStale(true);
@@ -1832,7 +1914,8 @@ function OptimizerMode() {
   const changeObjective = (v) => { setObjective(v); markStale(); };
 
   const computeResults = () => {
-    setCommitted({ counts: { ...counts }, restoCount, numGroups, objective, overflow, poolContributors });
+    const { trimmedCounts, trimmedRestoCount, trimmedContributors, benchList } = trimPoolToCapacity(counts, restoCount, poolContributors, capacity, factors);
+    setCommitted({ trimmedCounts, trimmedRestoCount, trimmedContributors, benchList, numGroups, objective });
     setStale(false);
   };
 
@@ -1914,8 +1997,8 @@ function OptimizerMode() {
       {suggestedContributors.length > 0 && (
         <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", background: "#12202b", border: "1px solid #2c6a8e", borderRadius: "6px", padding: "10px 14px", marginBottom: "16px" }}>
           <span style={{ fontSize: "12px", color: "#7ec1f0" }}>
-            {suggestedContributors.length} custom profile{suggestedContributors.length > 1 ? "s" : ""} already {suggestedContributors.length > 1 ? "have" : "has"} valid
-            data for the current settings, but {suggestedContributors.length > 1 ? "aren't" : "isn't"} in your pool: {suggestedContributors.map((c) => c.name).join(", ")}.
+            {suggestedContributors.length} custom profile{suggestedContributors.length > 1 ? "s" : ""} {suggestedContributors.length > 1 ? "were" : "was"} included
+            in another saved loadout with this same encounter and settings, but {suggestedContributors.length > 1 ? "aren't" : "isn't"} in your pool: {suggestedContributors.map((c) => c.name).join(", ")}.
           </span>
           <button
             onClick={() => {
@@ -1960,42 +2043,47 @@ function OptimizerMode() {
             ))}
           </select>
         </label>
-        <span style={{ fontSize: "13px", color: overflow ? "#e05c5c" : "#aaa" }}>
+        <span style={{ fontSize: "13px", color: overflow ? "#c9962c" : "#aaa" }}>
           {totalLocked}/{capacity - contributorCapacity} players placed
         </span>
       </div>
 
       <button
         onClick={computeResults}
-        disabled={overflow}
         style={{
           display: "flex", alignItems: "center", justifyContent: "center", gap: "8px", width: "100%",
-          background: overflow ? "#2a2a2a" : stale || !committed ? "#c9962c" : "#252525",
-          color: overflow ? "#777" : stale || !committed ? "#1a1400" : "#ccc",
-          border: "1px solid " + (overflow ? "#444" : "#c9962c"),
+          background: stale || !committed ? "#c9962c" : "#252525",
+          color: stale || !committed ? "#1a1400" : "#ccc",
+          border: "1px solid #c9962c",
           borderRadius: "6px", padding: "10px 16px", fontSize: "14px", fontWeight: 600,
-          cursor: overflow ? "not-allowed" : "pointer", marginBottom: "18px",
+          cursor: "pointer", marginBottom: "18px",
         }}
       >
         {committed && !stale ? "results up to date" : "compute best split"}
       </button>
 
       {overflow && (
-        <div style={{ display: "flex", gap: "8px", alignItems: "center", background: "#3a1f1f", border: "1px solid #6b2c2c", borderRadius: "6px", padding: "10px 14px", color: "#e0a0a0", fontSize: "13px", marginBottom: "14px" }}>
+        <div style={{ display: "flex", gap: "8px", alignItems: "center", background: "#3a2f1f", border: "1px solid #6b4c2c", borderRadius: "6px", padding: "10px 14px", color: "#e0b880", fontSize: "13px", marginBottom: "14px" }}>
           <AlertTriangle size={16} />
-          {totalLocked} players won't fit in {numGroups} group{numGroups > 1 ? "s" : ""} ({capacity} slots) - remove some or add another group.
+          {totalLocked} players won't all fit in {numGroups} group{numGroups > 1 ? "s" : ""} ({capacity} slots) - computing will automatically bench the lowest-DPS ones to fit.
         </div>
       )}
 
-      {!committed && !overflow && (
+      {!committed && (
         <div style={{ fontSize: "13px", color: "#999" }}>No results yet - press compute best split above.</div>
       )}
 
-      {committed && stale && !overflow && (
+      {committed && stale && (
         <div style={{ fontSize: "12px", color: "#c9962c", marginBottom: "10px" }}>Inputs changed - press compute to refresh the results below.</div>
       )}
 
-      {committed && !overflow && !results && (
+      {committed && committed.benchList.length > 0 && (
+        <div style={{ fontSize: "12px", color: "#c9962c", marginBottom: "10px" }}>
+          {formatBenchList(committed.benchList)} {committed.benchList.length > 1 ? "are" : "is"} on the bench (roster exceeded the {committed.numGroups * 5}-slot capacity - lowest DPS benched first).
+        </div>
+      )}
+
+      {committed && !results && (
         <div style={{ fontSize: "13px", color: "#999" }}>
           That roster can't be split across {committed.numGroups} group{committed.numGroups > 1 ? "s" : ""} - too many of one exclusive spec.
         </div>
