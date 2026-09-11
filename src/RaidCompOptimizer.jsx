@@ -813,6 +813,33 @@ function parseBuffContributor(rawJson, filenameFallback) {
 
 const DEFAULT_RAID_BUFFS = { arcaneBrilliance: true, powerWordFortitude: "TristateEffectImproved", shadowProtection: true, divineSpirit: "TristateEffectImproved", giftOfTheWild: "TristateEffectImproved", bloodlust: true };
 
+// Order-independent deep equality for plain JSON-like data (objects/arrays/primitives) - a naive
+// JSON.stringify comparison would give false negatives if the same settings got built with keys
+// in a different order (e.g. after a JSON upload vs the app's own field edits).
+function deepEqual(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b || a == null || b == null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    return a.every((v, i) => deepEqual(v, b[i]));
+  }
+  if (typeof a === "object") {
+    const keysA = Object.keys(a), keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    return keysA.every((k) => deepEqual(a[k], b[k]));
+  }
+  return false;
+}
+
+// The static PRESET_FACTORS table was computed under these exact default settings - if nothing has
+// changed from them, presets don't need resimming at all, since their existing factors are already
+// correct. This is checked fresh each time (not cached), so it stays right even if defaults change.
+function settingsMatchDefault(debuffs, encounter, raidBuffs) {
+  return deepEqual(debuffs, DEFAULT_DEBUFFS) && deepEqual(encounter, DEFAULT_ENCOUNTER) && deepEqual(raidBuffs, DEFAULT_RAID_BUFFS);
+}
+
+
 // ---------- saved loadouts (localStorage) ----------
 // A loadout snapshots everything needed to reproduce a full setup instantly, without re-resimming:
 // encounter/debuffs/raid buffs, which presets are excluded, every custom profile (including its raw
@@ -1068,6 +1095,10 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
 
   const iterationsFor = (p) => PRECISION_OPTIONS.find((o) => o.value === p)?.iterations ?? 700;
 
+  // Tracks which settings snapshot each id (preset or contributor) was actually last resimmed
+  // under - lets us skip a resim entirely when nothing relevant has changed since.
+  const [resimmedUnderSettings, setResimmedUnderSettings] = useState({});
+
   const resimSpec = useCallback(async (specId, playerOverride, debuffsOverride, encounterOverride, raidBuffsOverride) => {
     if (presetsUnavailable) throw new Error("Resimming isn't available in this preview - it needs preset data served from the deployed website (see README).");
     const player = playerOverride || customPlayers[specId] || presetPlayers[specId];
@@ -1081,6 +1112,7 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
         setSimProgress({ specId, current, total });
       });
       setFactorsState((prev) => ({ ...prev, [specId]: newFactors }));
+      setResimmedUnderSettings((prev) => ({ ...prev, [specId]: { debuffs: effectiveDebuffs, encounter: effectiveEncounter, raidBuffs: effectiveRaidBuffs } }));
     } finally {
       setSimProgress(null);
     }
@@ -1145,16 +1177,32 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
   // that has a personal-DPS sim profile chosen - custom profiles are the ones an actual roster
   // relies on, so they need to stay in sync with settings changes just as much as presets do.
   const resimAll = useCallback(async (debuffsOverride, encounterOverride, raidBuffsOverride) => {
+    const effectiveDebuffs = debuffsOverride || debuffs;
+    const effectiveEncounter = encounterOverride || encounter;
+    const effectiveRaidBuffs = raidBuffsOverride || raidBuffs;
+    const isDefault = settingsMatchDefault(effectiveDebuffs, effectiveEncounter, effectiveRaidBuffs);
+    const alreadyCurrent = (id) => {
+      const snap = resimmedUnderSettings[id];
+      return snap && deepEqual(snap.debuffs, effectiveDebuffs) && deepEqual(snap.encounter, effectiveEncounter) && deepEqual(snap.raidBuffs, effectiveRaidBuffs);
+    };
     for (const specId of Object.keys(presetFactors)) {
       if (excludedPresets.has(specId)) continue;
+      if (isDefault) {
+        // The static factor table was built under exactly these settings - no need to spend time
+        // resimming, just restore the known-correct values directly.
+        setFactorsState((prev) => ({ ...prev, [specId]: presetFactors[specId] }));
+        continue;
+      }
+      if (alreadyCurrent(specId)) continue; // already resimmed under these exact settings - nothing changed
       await resimSpec(specId, undefined, debuffsOverride, encounterOverride, raidBuffsOverride);
     }
     for (const contributor of buffContributors) {
       if (!contributor.simProfileChoice) continue;
+      if (alreadyCurrent(contributor.id)) continue; // this profile's cached factors are still valid for these settings
       const player = parseUploadedProfile(contributor.rawJson, presetPlayers[contributor.simProfileChoice], contributor.blessings);
       await resimSpec(contributor.id, player, debuffsOverride, encounterOverride, raidBuffsOverride);
     }
-  }, [presetFactors, resimSpec, excludedPresets, buffContributors, presetPlayers]);
+  }, [presetFactors, resimSpec, excludedPresets, buffContributors, presetPlayers, debuffs, encounter, raidBuffs, resimmedUnderSettings]);
 
   const value = {
     factors, profileMeta, debuffs, encounter, raidBuffs, settingsAreDefault, precision, setPrecision,
@@ -1162,6 +1210,7 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
     presetFactors, presetsUnavailable,
     buffContributors, addBuffContributor, removeBuffContributor, setContributorTotemChoice, renameContributor, setContributorSimProfile, setContributorBlessings, excludedPresets, togglePresetExcluded,
     loadouts, activeLoadoutId, saveLoadout, autoSaveLoadout, renameLoadout, deleteLoadout, applyLoadoutById, applyDefaultLoadout,
+    resimmedUnderSettings,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
@@ -1186,6 +1235,16 @@ function specDisplayLabel(specId, baseLabel, profileMeta) {
   const meta = profileMeta[specId];
   if (meta?.isCustom) return `Custom: ${meta.label || baseLabel}`;
   return `Preset: ${baseLabel}`;
+}
+
+// Resolves an internal id (a fixed preset id, or a generated "<timestamp>_<random>" contributor id)
+// to whatever name a person should actually see - never the raw id itself.
+function resolveProgressName(id, buffContributors) {
+  const spec = SPEC_LIST.find((s) => s.id === id);
+  if (spec) return spec.label;
+  const contributor = buffContributors?.find((c) => c.id === id);
+  if (contributor) return contributor.name;
+  return id;
 }
 
 function AppShell() {
@@ -1366,7 +1425,7 @@ function LoadProfileSelector() {
                 value={l.name}
                 onChange={(e) => renameLoadout(l.id, e.target.value)}
                 autoFocus
-                style={{ background: "transparent", border: "none", outline: "none", color: "#7ec1f0", fontSize: "12px", padding: "2px 0", width: `${Math.max(70, l.name.length * 7 + 10)}px` }}
+                style={{ background: "transparent", border: "none", outline: "none", color: "#7ec1f0", fontSize: "12px", padding: "2px 0", width: `${Math.max(8, l.name.length + 1)}ch` }}
               />
             ) : (
               <span onClick={() => applyLoadoutById(l.id)} style={{ cursor: "pointer", color: "#ccc" }}>{l.name}</span>
@@ -1546,7 +1605,7 @@ function ManualBuilder() {
 }
 
 function OptimizerMode() {
-  const { factors, profileMeta, excludedPresets, buffContributors } = useAppContext();
+  const { factors, profileMeta, excludedPresets, buffContributors, resimmedUnderSettings, debuffs, encounter, raidBuffs } = useAppContext();
   const emptyCounts = () => Object.fromEntries(SPEC_LIST.map((s) => [s.id, 0]));
   const [counts, setCounts] = useState(emptyCounts());
   const [restoCount, setRestoCount] = useState(0);
@@ -1565,6 +1624,18 @@ function OptimizerMode() {
     [buffContributors, factors]
   );
   const [contributorCounts, setContributorCounts] = useState({});
+  const [dismissedSuggestionIds, setDismissedSuggestionIds] = useState(new Set());
+  // Profiles with valid cached data for the CURRENT settings, not yet in the pool, and not dismissed -
+  // rather than silently auto-including them (which could surprise someone with players they didn't
+  // choose), this surfaces them as a one-click opt-in instead.
+  const suggestedContributors = useMemo(() => {
+    return activeContributors.filter((c) => {
+      if ((contributorCounts[c.id] || 0) > 0) return false;
+      if (dismissedSuggestionIds.has(c.id)) return false;
+      const snap = resimmedUnderSettings[c.id];
+      return snap && deepEqual(snap.debuffs, debuffs) && deepEqual(snap.encounter, encounter) && deepEqual(snap.raidBuffs, raidBuffs);
+    });
+  }, [activeContributors, contributorCounts, dismissedSuggestionIds, resimmedUnderSettings, debuffs, encounter, raidBuffs]);
   const updateContributorCount = (id, delta) => {
     setContributorCounts((prev) => ({ ...prev, [id]: Math.max(0, (prev[id] || 0) + delta) }));
     markStale();
@@ -1677,6 +1748,34 @@ function OptimizerMode() {
           {excludedPresets.size} preset{excludedPresets.size > 1 ? "s" : ""} hidden here (not kept in sync with current
           settings, so their DPS can't be trusted for optimizing - see Profiles &amp; settings to re-include).
         </p>
+      )}
+
+      {suggestedContributors.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap", background: "#12202b", border: "1px solid #2c6a8e", borderRadius: "6px", padding: "10px 14px", marginBottom: "16px" }}>
+          <span style={{ fontSize: "12px", color: "#7ec1f0" }}>
+            {suggestedContributors.length} custom profile{suggestedContributors.length > 1 ? "s" : ""} already {suggestedContributors.length > 1 ? "have" : "has"} valid
+            data for the current settings, but {suggestedContributors.length > 1 ? "aren't" : "isn't"} in your pool: {suggestedContributors.map((c) => c.name).join(", ")}.
+          </span>
+          <button
+            onClick={() => {
+              setContributorCounts((prev) => {
+                const next = { ...prev };
+                for (const c of suggestedContributors) next[c.id] = Math.max(1, next[c.id] || 0);
+                return next;
+              });
+              markStale();
+            }}
+            style={{ background: "#2c6a8e", border: "none", borderRadius: "4px", color: "#fff", fontSize: "11px", padding: "5px 10px", cursor: "pointer", whiteSpace: "nowrap" }}
+          >
+            include all
+          </button>
+          <button
+            onClick={() => setDismissedSuggestionIds((prev) => new Set([...prev, ...suggestedContributors.map((c) => c.id)]))}
+            style={{ background: "none", border: "1px solid #2c6a8e", borderRadius: "4px", color: "#7ec1f0", fontSize: "11px", padding: "5px 10px", cursor: "pointer", whiteSpace: "nowrap" }}
+          >
+            dismiss
+          </button>
+        </div>
       )}
 
       <div style={{ display: "flex", alignItems: "center", gap: "18px", marginBottom: "14px", flexWrap: "wrap" }}>
@@ -1925,6 +2024,14 @@ function SettingsPanel() {
 
   const iterations = PRECISION_OPTIONS.find((o) => o.value === precision)?.iterations ?? 700;
   const perProfileEstimate = Math.round(estimateSeconds(iterations) * TOTAL_SIM_JOBS);
+  const draftEffectiveEncounter = useMemo(() => {
+    if (draftEncounterOverride) return draftEncounterOverride;
+    const newTargetStats = [...encounter.targets[0].stats];
+    newTargetStats[31] = draftArmor;
+    return { ...encounter, duration: draftDuration, targets: [{ ...encounter.targets[0], level: draftLevel, mobType: draftMobType, stats: newTargetStats }] };
+  }, [draftEncounterOverride, encounter, draftDuration, draftLevel, draftArmor, draftMobType]);
+  const willSkipPresets = settingsMatchDefault(draftDebuffs, draftEffectiveEncounter, draftRaidBuffs);
+  const presetsToResimCount = willSkipPresets ? 0 : SPEC_LIST.length - excludedPresets.size;
 
   const readUploadedJson = async (file) => {
     if (file.size > MAX_UPLOAD_BYTES) {
@@ -2067,7 +2174,7 @@ function SettingsPanel() {
       {simProgress && (
         <div style={{ display: "flex", alignItems: "center", gap: "10px", background: "#2a2410", border: "1px solid #c9962c", borderRadius: "6px", padding: "10px 16px", marginBottom: "20px", fontSize: "13px", color: "#f0c14b" }}>
           <Loader2 size={16} style={{ animation: "spin 1s linear infinite", flexShrink: 0 }} />
-          <span>Resimming {simProgress.specId}: {simProgress.current}/{simProgress.total} sims done...</span>
+          <span>Resimming {resolveProgressName(simProgress.specId, buffContributors)}: {simProgress.current}/{simProgress.total} sims done...</span>
         </div>
       )}
 
@@ -2397,12 +2504,12 @@ function SettingsPanel() {
             cursor: settingsDirty && !presetsUnavailable ? "pointer" : "not-allowed",
           }}
         >
-          {resimmingAll ? "resimming everything..." : `apply & resim all profiles (~${Math.round(perProfileEstimate * (SPEC_LIST.length - excludedPresets.size + buffContributors.filter((c) => c.simProfileChoice).length) / 60)} min total)`}
+          {resimmingAll ? "resimming everything..." : `apply & resim all profiles (~${Math.round(perProfileEstimate * (presetsToResimCount + buffContributors.filter((c) => c.simProfileChoice).length) / 60)} min total${willSkipPresets ? " - presets skip, settings match default" : ""})`}
         </button>
         {simProgress && (
           <div style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", color: "#f0c14b" }}>
             <Loader2 size={16} style={{ animation: "spin 1s linear infinite", flexShrink: 0 }} />
-            <span>Resimming {simProgress.specId}: {simProgress.current}/{simProgress.total} sims done...</span>
+            <span>Resimming {resolveProgressName(simProgress.specId, buffContributors)}: {simProgress.current}/{simProgress.total} sims done...</span>
           </div>
         )}
         {!settingsAreDefault && (
