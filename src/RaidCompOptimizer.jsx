@@ -645,6 +645,52 @@ function validateFlatBuffObject(obj, label) {
 // 0 DPS - proven earlier when building this tool). So gear/talents/consumables/race/profession/name
 // are taken from the upload, but rotation and the spec-options block are always substituted from
 // the matching preset's known-working APL, regardless of what the upload contains for those fields.
+// The preset's APL hardcodes reasonable defaults (melee weave on, viper thresholds at 5%/25%,
+// multi/arcane shot on) as named value-variables - but a hunter's legacy "simple" rotation export
+// carries real, meaningful choices (turret vs weave being the big one) that would otherwise be
+// silently discarded even though the preset rotation itself is what actually runs. This surgically
+// overrides just those specific named variables rather than trying to use the legacy rotation
+// wholesale (which doesn't execute in this engine at all).
+const HUNTER_ROTATION_VAR_MAP = {
+  meleeWeave: { varName: "Melee weave", format: (v) => (v ? "true" : "false") },
+  timeToWeave: { varName: "Time to weave", format: (v) => `${v}ms` },
+  useMulti: { varName: "Use Multi-Shot", format: (v) => (v ? "true" : "false") },
+  useArcane: { varName: "Use Arcane Shot", format: (v) => (v ? "true" : "false") },
+  viperStartManaPercent: { varName: "Viper start", format: (v) => `${v * 100}%` },
+  viperStopManaPercent: { varName: "Viper stop", format: (v) => `${v * 100}%` },
+};
+
+function applyLegacyHunterRotationOverrides(presetRotation, specRotationJsonStr) {
+  let legacy;
+  try {
+    legacy = JSON.parse(specRotationJsonStr);
+  } catch {
+    return presetRotation; // malformed - leave the preset rotation untouched rather than guessing
+  }
+  if (!presetRotation?.valueVariables) return presetRotation;
+  const overrides = new Map();
+  // Boolean fields follow this JSON format's usual proto convention: omitted means the zero-value
+  // (false), not "unspecified, use the preset's default" - mealeeWeave is exactly the case that
+  // matters here, since a turret rotation is defined by *omitting* it, not setting it false. Numeric
+  // fields don't have as clean a "missing means zero" story (0% viper start is a real, different
+  // choice from "not specified"), so those only override when actually present.
+  const BOOLEAN_KEYS = new Set(["meleeWeave", "useMulti", "useArcane"]);
+  for (const [legacyKey, { varName, format }] of Object.entries(HUNTER_ROTATION_VAR_MAP)) {
+    if (BOOLEAN_KEYS.has(legacyKey)) {
+      overrides.set(varName, format(!!legacy[legacyKey]));
+    } else if (legacy[legacyKey] !== undefined) {
+      overrides.set(varName, format(legacy[legacyKey]));
+    }
+  }
+  if (overrides.size === 0) return presetRotation;
+  return {
+    ...presetRotation,
+    valueVariables: presetRotation.valueVariables.map((vv) =>
+      overrides.has(vv.name) ? { ...vv, value: { const: { val: overrides.get(vv.name) } } } : vv
+    ),
+  };
+}
+
 function parseUploadedProfile(rawJson, presetPlayer, blessingsOverride) {
   if (!rawJson || typeof rawJson !== "object") throw new Error("not a valid JSON object");
   if (!rawJson.player || typeof rawJson.player !== "object") throw new Error("uploaded JSON has no 'player' field");
@@ -682,6 +728,13 @@ function parseUploadedProfile(rawJson, presetPlayer, blessingsOverride) {
       if (uploaded[key] !== undefined) specOptionsFromUpload[key] = uploaded[key];
     }
   }
+  // Even when falling back to the preset's rotation (the common case), a hunter's legacy rotation
+  // still carries real settings worth respecting - pull those specific values out and apply them
+  // as overrides on top of the preset's own APL variables.
+  let presetRotationWithOverrides = presetPlayer.rotation;
+  if (!rotationIsUsable && uploaded.class === "ClassHunter" && uploadedRotationType === "TypeSimple" && uploaded.rotation?.simple?.specRotationJson) {
+    presetRotationWithOverrides = applyLegacyHunterRotationOverrides(presetPlayer.rotation, uploaded.rotation.simple.specRotationJson);
+  }
 
   return {
     ...presetPlayer,
@@ -697,7 +750,7 @@ function parseUploadedProfile(rawJson, presetPlayer, blessingsOverride) {
     // whatever the raw upload said.
     buffs: blessingsOverride ? { ...baseBuffs, ...blessingsOverride } : baseBuffs,
     bonusStats: typeof uploaded.bonusStats === "object" && uploaded.bonusStats ? uploaded.bonusStats : presetPlayer.bonusStats,
-    ...(rotationIsUsable ? { rotation: uploaded.rotation, ...specOptionsFromUpload } : {}),
+    ...(rotationIsUsable ? { rotation: uploaded.rotation, ...specOptionsFromUpload } : { rotation: presetRotationWithOverrides }),
   };
 }
 
