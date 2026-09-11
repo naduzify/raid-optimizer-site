@@ -253,14 +253,17 @@ function allocateRaid(pool, numGroups, objective, factors, excludedPresets, acti
 
   // Custom profiles get folded into the exact same search as presets - each distinct "buff
   // signature" among them (see contributorSignature) is treated as its own category, exactly like
-  // fury_warrior or enhance_shaman are. This means the search jointly considers where to put actual
-  // people alongside where to put custom profiles, instead of deciding one before the other.
-  const allStages = [...CATEGORY_STAGES, signatureIds.length ? signatureIds : null].filter(Boolean);
+  // fury_warrior or enhance_shaman are. Each signature needs to be its OWN stage (not lumped
+  // together into one), the same way each preset spec gets its own stage - otherwise
+  // enumerateCategoryPlacements' one-id-per-group-per-stage rule would wrongly prevent two
+  // different custom profiles (different signatures) from ever sharing a group.
+  const contribStages = signatureIds.map((sig) => ({ isContrib: true, sig }));
+  const allStages = [...CATEGORY_STAGES, ...contribStages];
 
   for (const stage of allStages) {
-    const isContribStage = stage === signatureIds;
+    const isContribStage = !!stage.isContrib;
     const memberCounts = isContribStage
-      ? Object.fromEntries(signatureIds.map((sig) => [sig, bySignature.get(sig).length]))
+      ? { [stage.sig]: bySignature.get(stage.sig).length }
       : Object.fromEntries(stage.map((id) => [id, pool[id] || 0]));
     if (Object.values(memberCounts).every((c) => c === 0)) continue;
     const nextStates = [];
@@ -377,9 +380,19 @@ function allocateRaid(pool, numGroups, objective, factors, excludedPresets, acti
       objective === "total" ? raidTotal :
       objective === "avg_pct" ? raidPctSum : // fixed player count across all arrangements, so this ranks the same as the true average
       Math.max(...groupResults.map((r) => (r.score > 0 ? r.score : -Infinity)));
-    scored.push({ groupResults, objectiveScore, raidTotal, raidAvgPct });
+    const occupiedGroups = groupResults.filter((r) => r.playerCount > 0).length;
+    scored.push({ groupResults, objectiveScore, raidTotal, raidAvgPct, occupiedGroups });
   }
-  scored.sort((a, b) => b.objectiveScore - a.objectiveScore);
+  // When two arrangements are (near enough) tied on DPS - which happens whenever there's nothing to
+  // gain or lose from spreading a small roster across more groups than it needs - prefer stacking
+  // into fewer groups. It's simpler to read and never costs anything: with no other buff-granters
+  // to reach or be reached by in the group that would otherwise sit empty, spreading is pure noise
+  // from the search's enumeration order, not a deliberate choice.
+  scored.sort((a, b) => {
+    const relDiff = Math.abs(a.objectiveScore - b.objectiveScore) / (Math.abs(a.objectiveScore) + Math.abs(b.objectiveScore) + 1e-9);
+    if (relDiff < 1e-9) return a.occupiedGroups - b.occupiedGroups;
+    return b.objectiveScore - a.objectiveScore;
+  });
 
   // dedupe splits that are practically identical (same multiset of group outcomes, order doesn't matter)
   const seen = new Set();
@@ -717,7 +730,7 @@ const KNOWN_CLASSES = new Set([
 // reliable hint the upload gives us (see detectSpecHint), falling back to the first entry.
 const CLASS_TO_SPECS = {
   ClassWarrior: ["fury_warrior", "arms2h_warrior"],
-  ClassHunter: ["bm_hunter"],
+  ClassHunter: ["bm_hunter", "survival_hunter"],
   ClassRogue: ["rogue"],
   ClassShaman: ["enhance_shaman"],
   ClassDruid: ["feral_dps", "feral_tank"],
@@ -752,6 +765,17 @@ function detectSpecHint(player) {
   }
   if (player?.feralCatDruid) return "feral_dps";
   if (player?.feralBearDruid) return "feral_tank";
+  if (player?.class === "ClassHunter" && typeof player.talentsString === "string") {
+    // TBC hunter trees are ordered Beast Mastery / Marksmanship / Survival - whichever of the
+    // BM or Survival tree has more points invested is a reasonable hint for which this person
+    // actually plays, since respeccing into the "wrong" build for that talent split is rare.
+    const trees = player.talentsString.split("-");
+    const sumPoints = (tree) => (tree || "").split("").reduce((s, c) => s + (parseInt(c, 10) || 0), 0);
+    const bmPoints = sumPoints(trees[0]);
+    const survivalPoints = sumPoints(trees[2]);
+    if (survivalPoints > bmPoints) return "survival_hunter";
+    if (bmPoints > 0) return "bm_hunter";
+  }
   return null;
 }
 
@@ -802,7 +826,10 @@ function parseBuffContributor(rawJson, filenameFallback) {
     // The JSON's own declared name wins - that's what the person actually typed for this
     // character/build, which may differ from whatever the file happens to be named on disk
     // (e.g. after multiple re-downloads). Filename is just a fallback if the JSON has no name at all.
-    name: ((typeof player.name === "string" && player.name.trim()) || filenameFallback || "unnamed").slice(0, 60),
+    // The JSON's own declared name would win if it were meaningful, but wowsims exports commonly
+    // leave this at the literal default "Player" rather than something the person actually typed -
+    // in that case the filename (which they do choose) is far more useful for telling profiles apart.
+    name: ((typeof player.name === "string" && player.name.trim() && player.name.trim() !== "Player" && player.name.trim()) || filenameFallback || "unnamed").slice(0, 60),
     class: player.class,
     capabilities,
     rawJson, // kept so we can re-parse against whichever spec the user picks for personal DPS
@@ -1006,6 +1033,25 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
   const [simProgress, setSimProgress] = useState(null); // { specId, current, total } | null
   const [customPlayers, setCustomPlayers] = useState({}); // specId -> parsed player object
   const [buffContributors, setBuffContributors] = useState([]); // [{id, name, class, capabilities, totemChoice}]
+
+  // Lifted out of OptimizerMode/ManualBuilder (rather than local component state) for two reasons:
+  // tabs are conditionally rendered, so local state would reset every time a tab unmounts and
+  // remounts on switch; and a saved loadout should restore the whole workspace, not just the
+  // underlying sim data, so this needs to be something save/restore can actually reach.
+  const emptyPoolCounts = () => Object.fromEntries(SPEC_LIST.map((s) => [s.id, 0]));
+  const [poolCounts, setPoolCounts] = useState(emptyPoolCounts());
+  const [poolRestoCount, setPoolRestoCount] = useState(0);
+  const [poolNumGroups, setPoolNumGroups] = useState(1);
+  const [poolObjective, setPoolObjective] = useState("total");
+  const [poolExcludeHunters, setPoolExcludeHunters] = useState(false);
+  const [poolContributorCounts, setPoolContributorCounts] = useState({});
+  const [poolDismissedSuggestionIds, setPoolDismissedSuggestionIds] = useState(new Set());
+
+  const [builderNumGroups, setBuilderNumGroups] = useState(1);
+  const [builderGroupSlots, setBuilderGroupSlots] = useState([Array(5).fill("empty")]);
+  const [builderAssumeSvHunter, setBuilderAssumeSvHunter] = useState(false);
+  const [builderAssumedAgility, setBuilderAssumedAgility] = useState(1068);
+  const [builderAssumedUptime, setBuilderAssumedUptime] = useState(90);
   const [excludedPresets, setExcludedPresets] = useState(new Set()); // preset spec ids to skip during "apply & resim all"
   const [loadouts, setLoadouts] = useState(() => loadLoadoutsFromStorage());
   const [activeLoadoutId, setActiveLoadoutId] = useState(null); // null = "Default" / an unsaved current state
@@ -1015,9 +1061,13 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
   // which updates factors incrementally across many state updates during its run, so a normal
   // closure here would save stale (pre-resim) factors. Refs sidestep that entirely.
   const latestRef = useRef({});
-  latestRef.current = { debuffs, encounter, raidBuffs, excludedPresets, buffContributors, factors };
+  latestRef.current = {
+    debuffs, encounter, raidBuffs, excludedPresets, buffContributors, factors,
+    poolCounts, poolRestoCount, poolNumGroups, poolObjective, poolExcludeHunters, poolContributorCounts,
+    builderNumGroups, builderGroupSlots, builderAssumeSvHunter, builderAssumedAgility, builderAssumedUptime,
+  };
 
-  const saveLoadout = useCallback((name) => {
+  const saveLoadout = useCallback((name, factorsOverride) => {
     const cur = latestRef.current;
     const loadout = {
       id: `loadout_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -1026,7 +1076,13 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
       debuffs: cur.debuffs, encounter: cur.encounter, raidBuffs: cur.raidBuffs,
       excludedPresets: [...cur.excludedPresets],
       buffContributors: cur.buffContributors,
-      factors: cur.factors,
+      factors: factorsOverride || cur.factors,
+      // the whole workspace, not just the underlying sim data - so reloading a loadout puts
+      // everything back exactly where it was, not just the numbers behind it
+      poolCounts: cur.poolCounts, poolRestoCount: cur.poolRestoCount, poolNumGroups: cur.poolNumGroups,
+      poolObjective: cur.poolObjective, poolExcludeHunters: cur.poolExcludeHunters, poolContributorCounts: cur.poolContributorCounts,
+      builderNumGroups: cur.builderNumGroups, builderGroupSlots: cur.builderGroupSlots,
+      builderAssumeSvHunter: cur.builderAssumeSvHunter, builderAssumedAgility: cur.builderAssumedAgility, builderAssumedUptime: cur.builderAssumedUptime,
     };
     setLoadouts((prev) => persistLoadoutsToStorage([...prev, loadout]));
     setActiveLoadoutId(loadout.id);
@@ -1036,9 +1092,11 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
   // Called automatically right after a successful "apply & resim all" - the whole point is the
   // user never has to remember to save; every resim leaves behind a named snapshot they can return
   // to instantly, and they can rename it whenever they want via the same editable-name pattern
-  // used for custom profiles elsewhere in the app.
-  const autoSaveLoadout = useCallback(() => {
-    return saveLoadout(formatLoadoutTimestamp(new Date()));
+  // used for custom profiles elsewhere in the app. Accepts the freshly-resimmed factors directly
+  // (from resimAll's return value) rather than reading factors back from state, since the last
+  // state update from resimAll may not have flushed into a re-render yet at the moment this runs.
+  const autoSaveLoadout = useCallback((freshFactors) => {
+    return saveLoadout(formatLoadoutTimestamp(new Date()), freshFactors);
   }, [saveLoadout]);
 
   const renameLoadout = useCallback((id, newName) => {
@@ -1061,6 +1119,19 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
     setFactorsState(loadout.factors);
     setSettingsAreDefault(false);
     setActiveLoadoutId(id);
+    // Older loadouts saved before this existed won't have these fields - fall back to sensible
+    // defaults rather than crashing on undefined.
+    setPoolCounts(loadout.poolCounts ?? emptyPoolCounts());
+    setPoolRestoCount(loadout.poolRestoCount ?? 0);
+    setPoolNumGroups(loadout.poolNumGroups ?? 1);
+    setPoolObjective(loadout.poolObjective ?? "total");
+    setPoolExcludeHunters(loadout.poolExcludeHunters ?? false);
+    setPoolContributorCounts(loadout.poolContributorCounts ?? {});
+    setBuilderNumGroups(loadout.builderNumGroups ?? 1);
+    setBuilderGroupSlots(loadout.builderGroupSlots ?? [Array(5).fill("empty")]);
+    setBuilderAssumeSvHunter(loadout.builderAssumeSvHunter ?? false);
+    setBuilderAssumedAgility(loadout.builderAssumedAgility ?? 1068);
+    setBuilderAssumedUptime(loadout.builderAssumedUptime ?? 90);
   }, [loadouts]);
 
   const applyDefaultLoadout = useCallback(() => {
@@ -1072,7 +1143,44 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
     setFactorsState(presetFactors);
     setSettingsAreDefault(true);
     setActiveLoadoutId(null);
+    setPoolCounts(emptyPoolCounts());
+    setPoolRestoCount(0);
+    setPoolNumGroups(1);
+    setPoolObjective("total");
+    setPoolExcludeHunters(false);
+    setPoolContributorCounts({});
+    setBuilderNumGroups(1);
+    setBuilderGroupSlots([Array(5).fill("empty")]);
+    setBuilderAssumeSvHunter(false);
+    setBuilderAssumedAgility(1068);
+    setBuilderAssumedUptime(90);
   }, [presetFactors]);
+
+  // Pool/builder selections (which specs are counted, which slots hold what) can change without a
+  // resim ever happening - e.g. just including an already-resimmed custom profile in the pool, or
+  // picking one in a Build & Compare slot. Without this, only a subsequent resim would capture
+  // those changes into the active loadout, so reloading it later would silently drop them - this
+  // keeps the currently active loadout's saved snapshot in sync with the live workspace at all times.
+  useEffect(() => {
+    if (!activeLoadoutId) return;
+    setLoadouts((prev) => {
+      const idx = prev.findIndex((l) => l.id === activeLoadoutId);
+      if (idx === -1) return prev;
+      const updated = {
+        ...prev[idx],
+        poolCounts, poolRestoCount, poolNumGroups, poolObjective, poolExcludeHunters, poolContributorCounts,
+        builderNumGroups, builderGroupSlots, builderAssumeSvHunter, builderAssumedAgility, builderAssumedUptime,
+      };
+      const next = [...prev];
+      next[idx] = updated;
+      const capped = persistLoadoutsToStorage(next);
+      return capped;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeLoadoutId, poolCounts, poolRestoCount, poolNumGroups, poolObjective, poolExcludeHunters, poolContributorCounts,
+    builderNumGroups, builderGroupSlots, builderAssumeSvHunter, builderAssumedAgility, builderAssumedUptime,
+  ]);
 
   const togglePresetExcluded = useCallback((specId) => {
     setExcludedPresets((prev) => {
@@ -1113,6 +1221,7 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
       });
       setFactorsState((prev) => ({ ...prev, [specId]: newFactors }));
       setResimmedUnderSettings((prev) => ({ ...prev, [specId]: { debuffs: effectiveDebuffs, encounter: effectiveEncounter, raidBuffs: effectiveRaidBuffs } }));
+      return newFactors;
     } finally {
       setSimProgress(null);
     }
@@ -1185,24 +1294,31 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
       const snap = resimmedUnderSettings[id];
       return snap && deepEqual(snap.debuffs, effectiveDebuffs) && deepEqual(snap.encounter, effectiveEncounter) && deepEqual(snap.raidBuffs, effectiveRaidBuffs);
     };
+    // Accumulated locally rather than read back from React state afterward - state updates
+    // triggered inside this loop aren't guaranteed to have flushed into a re-render by the time
+    // this function returns, so anything that needs the truly final factors (like auto-saving a
+    // loadout right after this resolves) should use this return value, not go back through state.
+    const finalFactors = { ...factors };
     for (const specId of Object.keys(presetFactors)) {
       if (excludedPresets.has(specId)) continue;
       if (isDefault) {
         // The static factor table was built under exactly these settings - no need to spend time
         // resimming, just restore the known-correct values directly.
         setFactorsState((prev) => ({ ...prev, [specId]: presetFactors[specId] }));
+        finalFactors[specId] = presetFactors[specId];
         continue;
       }
       if (alreadyCurrent(specId)) continue; // already resimmed under these exact settings - nothing changed
-      await resimSpec(specId, undefined, debuffsOverride, encounterOverride, raidBuffsOverride);
+      finalFactors[specId] = await resimSpec(specId, undefined, debuffsOverride, encounterOverride, raidBuffsOverride);
     }
     for (const contributor of buffContributors) {
       if (!contributor.simProfileChoice) continue;
       if (alreadyCurrent(contributor.id)) continue; // this profile's cached factors are still valid for these settings
       const player = parseUploadedProfile(contributor.rawJson, presetPlayers[contributor.simProfileChoice], contributor.blessings);
-      await resimSpec(contributor.id, player, debuffsOverride, encounterOverride, raidBuffsOverride);
+      finalFactors[contributor.id] = await resimSpec(contributor.id, player, debuffsOverride, encounterOverride, raidBuffsOverride);
     }
-  }, [presetFactors, resimSpec, excludedPresets, buffContributors, presetPlayers, debuffs, encounter, raidBuffs, resimmedUnderSettings]);
+    return finalFactors;
+  }, [presetFactors, resimSpec, excludedPresets, buffContributors, presetPlayers, debuffs, encounter, raidBuffs, resimmedUnderSettings, factors]);
 
   const value = {
     factors, profileMeta, debuffs, encounter, raidBuffs, settingsAreDefault, precision, setPrecision,
@@ -1211,6 +1327,12 @@ function AppProvider({ presetFactors, presetPlayers, presetsUnavailable, childre
     buffContributors, addBuffContributor, removeBuffContributor, setContributorTotemChoice, renameContributor, setContributorSimProfile, setContributorBlessings, excludedPresets, togglePresetExcluded,
     loadouts, activeLoadoutId, saveLoadout, autoSaveLoadout, renameLoadout, deleteLoadout, applyLoadoutById, applyDefaultLoadout,
     resimmedUnderSettings,
+    poolCounts, setPoolCounts, poolRestoCount, setPoolRestoCount, poolNumGroups, setPoolNumGroups,
+    poolObjective, setPoolObjective, poolExcludeHunters, setPoolExcludeHunters,
+    poolContributorCounts, setPoolContributorCounts, poolDismissedSuggestionIds, setPoolDismissedSuggestionIds,
+    builderNumGroups, setBuilderNumGroups, builderGroupSlots, setBuilderGroupSlots,
+    builderAssumeSvHunter, setBuilderAssumeSvHunter, builderAssumedAgility, setBuilderAssumedAgility,
+    builderAssumedUptime, setBuilderAssumedUptime,
   };
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
@@ -1365,11 +1487,22 @@ function slotsToCounts(slots, buffContributors) {
 
 // Explicit slots mean no search is needed here - if a survival hunter is placed, we know exactly
 // which totem (if any) their own group gives them. fallbackOverride is the manual "assume" checkbox.
-function computeManualRaidWideEW(groupSlotsArray, fallbackOverride) {
+// Checks both a direct survival_hunter preset slot AND a custom profile slot whose chosen sim
+// profile is survival_hunter - slotsToCounts only tracks what buffs a contributor grants, not
+// which preset spec they're standing in for, so that needs checking directly here instead.
+function computeManualRaidWideEW(groupSlotsArray, fallbackOverride, buffContributors) {
   let maxAgility = null;
   for (const slots of groupSlotsArray) {
-    const { counts, restoAgi, restoWf } = slotsToCounts(slots);
-    if (counts.survival_hunter > 0) {
+    const { counts, restoAgi, restoWf } = slotsToCounts(slots, buffContributors);
+    const hasHunter = slots.some((v) => {
+      if (v === "survival_hunter") return true;
+      if (typeof v === "string" && v.startsWith("contrib:")) {
+        const c = (buffContributors || []).find((x) => x.id === v.slice(8));
+        return c?.simProfileChoice === "survival_hunter";
+      }
+      return false;
+    });
+    if (hasHunter) {
       const shamanState = resolveShamanState(counts.enhance_shaman, restoAgi, restoWf);
       const agility = EW_BASE_AGILITY + survivalHunterAgilityBump(shamanState);
       if (maxAgility === null || agility > maxAgility) maxAgility = agility;
@@ -1445,12 +1578,14 @@ function LoadProfileSelector() {
 }
 
 function ManualBuilder() {
-  const { factors, profileMeta, buffContributors, excludedPresets } = useAppContext();
-  const [numGroups, setNumGroups] = useState(1);
-  const [groupSlots, setGroupSlots] = useState([Array(5).fill("empty")]);
-  const [assumeSvHunter, setAssumeSvHunter] = useState(false);
-  const [assumedAgility, setAssumedAgility] = useState(1068);
-  const [assumedUptime, setAssumedUptime] = useState(90);
+  const {
+    factors, profileMeta, buffContributors, excludedPresets,
+    builderNumGroups: numGroups, setBuilderNumGroups: setNumGroups,
+    builderGroupSlots: groupSlots, setBuilderGroupSlots: setGroupSlots,
+    builderAssumeSvHunter: assumeSvHunter, setBuilderAssumeSvHunter: setAssumeSvHunter,
+    builderAssumedAgility: assumedAgility, setBuilderAssumedAgility: setAssumedAgility,
+    builderAssumedUptime: assumedUptime, setBuilderAssumedUptime: setAssumedUptime,
+  } = useAppContext();
 
   const setNumGroupsAndResize = (n) => {
     setNumGroups(n);
@@ -1465,9 +1600,16 @@ function ManualBuilder() {
     setGroupSlots((prev) => prev.map((g, gi) => (gi === groupIdx ? g.map((v, si) => (si === slotIdx ? value : v)) : g)));
   };
 
-  const raidHasSurvivalHunter = groupSlots.some((slots) => slots.includes("survival_hunter"));
+  const raidHasSurvivalHunter = groupSlots.some((slots) => slots.some((v) => {
+    if (v === "survival_hunter") return true;
+    if (typeof v === "string" && v.startsWith("contrib:")) {
+      const c = (buffContributors || []).find((x) => x.id === v.slice(8));
+      return c?.simProfileChoice === "survival_hunter";
+    }
+    return false;
+  }));
   const assumedOverride = assumeSvHunter ? { agility: assumedAgility, uptime: assumedUptime / 100 } : null;
-  const ewOverride = computeManualRaidWideEW(groupSlots, assumedOverride);
+  const ewOverride = computeManualRaidWideEW(groupSlots, assumedOverride, buffContributors);
 
   const groupEvals = groupSlots.map((slots) => evalSlots(slots, ewOverride, factors, buffContributors, excludedPresets));
   const raidTotal = groupEvals.reduce((a, e) => a + e.total, 0);
@@ -1561,10 +1703,23 @@ function ManualBuilder() {
               )}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: "10px" }}>
                 {slots.map((val, sIdx) => {
-                  const withoutSlots = [...slots];
-                  withoutSlots[sIdx] = "empty";
-                  const withoutTotal = evalSlots(withoutSlots, ewOverride, factors, buffContributors, excludedPresets).total;
-                  const marginal = evalResult.total - withoutTotal;
+                  const isSurvivalHunterSlot = val === "survival_hunter" || (typeof val === "string" && val.startsWith("contrib:") && buffContributors.find((c) => c.id === val.slice(8))?.simProfileChoice === "survival_hunter");
+                  let marginal;
+                  if (isSurvivalHunterSlot) {
+                    // A survival hunter's value isn't just what their own group loses without them -
+                    // removing them can drop Expose Weakness raid-wide (if they're the only one), which
+                    // affects every other group too. So this recomputes the true raid-wide total without
+                    // them, rather than just this one group's total.
+                    const withoutGroupSlots = groupSlots.map((s, i) => (i === gIdx ? s.map((v, j) => (j === sIdx ? "empty" : v)) : s));
+                    const ewOverrideWithout = computeManualRaidWideEW(withoutGroupSlots, assumedOverride, buffContributors);
+                    const raidTotalWithout = withoutGroupSlots.reduce((sum, s) => sum + evalSlots(s, ewOverrideWithout, factors, buffContributors, excludedPresets).total, 0);
+                    marginal = raidTotal - raidTotalWithout;
+                  } else {
+                    const withoutSlots = [...slots];
+                    withoutSlots[sIdx] = "empty";
+                    const withoutTotal = evalSlots(withoutSlots, ewOverride, factors, buffContributors, excludedPresets).total;
+                    marginal = evalResult.total - withoutTotal;
+                  }
                   const specMeta = SPEC_LIST.find((s) => s.id === val);
                   const lookupId = typeof val === "string" && val.startsWith("contrib:") ? val.slice(8) : val;
                   const personalDps = (specMeta || val.startsWith?.("contrib:")) ? evalResult.breakdown.find((b) => b.id === lookupId)?.dpsEach : null;
@@ -1595,7 +1750,7 @@ function ManualBuilder() {
                       </select>
                       <div style={{ fontSize: "11px", color: "#999", display: "flex", justifyContent: "space-between" }}>
                         <span>personal: {personalDps != null ? Math.round(personalDps).toLocaleString() : "-"}</span>
-                        <span style={{ color: "#7ec1f0" }}>+group: {Math.round(marginal).toLocaleString()}</span>
+                        <span style={{ color: "#7ec1f0" }}>{isSurvivalHunterSlot ? "+raid" : "+group"}: {Math.round(marginal).toLocaleString()}</span>
                       </div>
                     </div>
                   );
@@ -1610,13 +1765,16 @@ function ManualBuilder() {
 }
 
 function OptimizerMode() {
-  const { factors, profileMeta, excludedPresets, buffContributors, resimmedUnderSettings, debuffs, encounter, raidBuffs } = useAppContext();
-  const emptyCounts = () => Object.fromEntries(SPEC_LIST.map((s) => [s.id, 0]));
-  const [counts, setCounts] = useState(emptyCounts());
-  const [restoCount, setRestoCount] = useState(0);
-  const [numGroups, setNumGroups] = useState(1);
-  const [objective, setObjective] = useState("total");
-  const [excludeHunters, setExcludeHunters] = useState(false);
+  const {
+    factors, profileMeta, excludedPresets, buffContributors, resimmedUnderSettings, debuffs, encounter, raidBuffs,
+    poolCounts: counts, setPoolCounts: setCounts,
+    poolRestoCount: restoCount, setPoolRestoCount: setRestoCount,
+    poolNumGroups: numGroups, setPoolNumGroups: setNumGroups,
+    poolObjective: objective, setPoolObjective: setObjective,
+    poolExcludeHunters: excludeHunters, setPoolExcludeHunters: setExcludeHunters,
+    poolContributorCounts: contributorCounts, setPoolContributorCounts: setContributorCounts,
+    poolDismissedSuggestionIds: dismissedSuggestionIds, setPoolDismissedSuggestionIds: setDismissedSuggestionIds,
+  } = useAppContext();
 
   const [committed, setCommitted] = useState(null); // snapshot used for computation
   const [stale, setStale] = useState(false); // true when inputs changed since last compute
@@ -1628,8 +1786,6 @@ function OptimizerMode() {
     () => buffContributors.filter((c) => c.simProfileChoice && factors[c.id]),
     [buffContributors, factors]
   );
-  const [contributorCounts, setContributorCounts] = useState({});
-  const [dismissedSuggestionIds, setDismissedSuggestionIds] = useState(new Set());
   // Profiles with valid cached data for the CURRENT settings, not yet in the pool, and not dismissed -
   // rather than silently auto-including them (which could surprise someone with players they didn't
   // choose), this surfaces them as a one-click opt-in instead.
@@ -1992,7 +2148,7 @@ function SettingsPanel() {
   const {
     debuffs, encounter, raidBuffs, settingsAreDefault, precision, setPrecision,
     simProgress, updateSettings, resetSettingsToDefault, resimAll,
-    presetsUnavailable, factors, buffContributors, addBuffContributor, removeBuffContributor, setContributorTotemChoice, renameContributor, setContributorSimProfile, setContributorBlessings, excludedPresets, togglePresetExcluded, autoSaveLoadout,
+    presetsUnavailable, factors, buffContributors, addBuffContributor, removeBuffContributor, setContributorTotemChoice, renameContributor, setContributorSimProfile, setContributorBlessings, excludedPresets, togglePresetExcluded, autoSaveLoadout, resimmedUnderSettings,
   } = useAppContext();
 
   const [draftDebuffs, setDraftDebuffs] = useState(debuffs);
@@ -2037,6 +2193,14 @@ function SettingsPanel() {
   }, [draftEncounterOverride, encounter, draftDuration, draftLevel, draftArmor, draftMobType]);
   const willSkipPresets = settingsMatchDefault(draftDebuffs, draftEffectiveEncounter, draftRaidBuffs);
   const presetsToResimCount = willSkipPresets ? 0 : SPEC_LIST.length - excludedPresets.size;
+  // A contributor is only worth counting toward the estimate (and the time it'll actually take) if
+  // its cached settings snapshot doesn't already match what we're about to apply - same "already
+  // current" check resimAll itself uses, just run here for display purposes before the click happens.
+  const contributorsToResimCount = buffContributors.filter((c) => {
+    if (!c.simProfileChoice) return false;
+    const snap = resimmedUnderSettings[c.id];
+    return !(snap && deepEqual(snap.debuffs, draftDebuffs) && deepEqual(snap.encounter, draftEffectiveEncounter) && deepEqual(snap.raidBuffs, draftRaidBuffs));
+  }).length;
 
   const readUploadedJson = async (file) => {
     if (file.size > MAX_UPLOAD_BYTES) {
@@ -2124,8 +2288,8 @@ function SettingsPanel() {
     setSettingsDirty(false);
     setResimmingAll(true);
     try {
-      await resimAll(draftDebuffs, newEncounter, draftRaidBuffs); // pass explicitly - state above hasn't committed yet
-      autoSaveLoadout(); // every successful resim leaves behind a named, instantly-reloadable snapshot
+      const freshFactors = await resimAll(draftDebuffs, newEncounter, draftRaidBuffs); // pass explicitly - state above hasn't committed yet
+      autoSaveLoadout(freshFactors); // every successful resim leaves behind a named, instantly-reloadable snapshot
     } catch (e) {
       setResimError(e.message);
     } finally {
@@ -2383,11 +2547,7 @@ function SettingsPanel() {
                           })}
                         </select>
                       </span>
-                    ) : (CLASS_TO_SPECS[c.class] || []).length > 0 ? (
-                      <span style={{ fontSize: "11px", color: "#999" }}>
-                        will be simmed as {SPEC_LIST.find((s) => s.id === c.simProfileChoice)?.label}
-                      </span>
-                    ) : (
+                    ) : (CLASS_TO_SPECS[c.class] || []).length > 0 ? null : (
                       <span style={{ fontSize: "11px", color: "#777" }}>not simmed for personal dps yet</span>
                     )}
                     {simProgress?.specId === c.id && <span style={{ fontSize: "11px", color: "#c9962c" }}>resimming {simProgress.current}/{simProgress.total}...</span>}
@@ -2509,7 +2669,7 @@ function SettingsPanel() {
             cursor: settingsDirty && !presetsUnavailable ? "pointer" : "not-allowed",
           }}
         >
-          {resimmingAll ? "resimming everything..." : `apply & resim all profiles (~${Math.round(perProfileEstimate * (presetsToResimCount + buffContributors.filter((c) => c.simProfileChoice).length) / 60)} min total${willSkipPresets ? " - presets skip, settings match default" : ""})`}
+          {resimmingAll ? "resimming everything..." : `apply & resim all profiles (~${Math.round(perProfileEstimate * (presetsToResimCount + contributorsToResimCount) / 60)} min total${willSkipPresets ? " - presets skip, settings match default" : ""})`}
         </button>
         {simProgress && (
           <div style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "13px", color: "#f0c14b" }}>
